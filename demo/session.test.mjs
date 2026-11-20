@@ -1,0 +1,11 @@
+import assert from 'node:assert/strict';import {createSession} from './session.mjs';
+const s=createSession();const read=()=>s.perform('inspect_plan',{},'agent');const resize=(w,h,source='agent')=>s.perform('resize_room',{id:'living',width:w,height:h,expectedRevision:s.get().plan.revision},source);
+read();resize(5,4);assert.deepEqual(s.get().proofs,[true,false,false,false]);
+read();assert.equal(s.get().observation.area,20);resize(5,5,'human');assert.equal(s.get().observation.area,20);assert.equal(s.get().proofs[1],false,'Manual edit alone does not prove agent readback');assert.notEqual(s.get().observation.revision,s.get().plan.revision);
+read();assert.equal(s.get().observation.area,25);assert.equal(s.get().proofs[1],true);
+const before=s.get().plan;assert.equal(resize(7,4).error,'OVERLAP');assert.deepEqual(s.get().plan,before,'Rejected proposal must not change geometry, history or revision');assert.equal(s.get().proofs[2],true);
+s.perform('undo_last_edit',{},'agent');read();assert.deepEqual(s.get().proofs,[true,true,true,true]);assert.equal(s.get().plan.rooms[0].area,20);assert.equal(s.get().plan.revision,3);
+assert.equal(s.get().trace.filter(x=>x.name==='resize_room').length,3);assert.equal(s.get().everNative,true);
+s.reset();assert.equal(s.get().plan.revision,0);assert.equal(s.get().trace.length,0);assert.deepEqual(s.get().proofs,[false,false,false,false]);assert.equal(s.get().everNative,false);
+const r=createSession();r.tools[0].execute({});r.tools[1].execute({id:'living',width:5,height:4,expectedRevision:0});assert.equal(r.get().last.source,'agent');assert.equal(r.get().plan.rooms[0].area,20);
+console.log('PASS: chapter proofs, readback, rejection atomicity, undo, reset, and registered tool wrappers');

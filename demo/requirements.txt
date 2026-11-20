@@ -1,0 +1,5 @@
+google-adk>=1.17,<2
+fastapi>=0.115,<1
+uvicorn[standard]>=0.30,<1
+python-dotenv>=1,<2
+python-socks[asyncio]>=2.4,<3

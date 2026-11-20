@@ -1,0 +1,10 @@
+import assert from 'node:assert/strict';import {createRoomLab} from './core.mjs';
+const lab=createRoomLab();assert.equal(lab.tools.length,4);assert.equal(lab.snapshot().rooms[0].area,16);
+assert.equal(lab.tools[1].execute({id:'living',width:5,height:4,expectedRevision:0}).room.area,20);
+const before=lab.snapshot();assert.equal(lab.resize({id:'living',width:7,height:4,expectedRevision:1}).error,'OVERLAP');assert.deepEqual(lab.snapshot(),before);
+assert.equal(lab.resize({id:'living',width:5,height:4,expectedRevision:0}).error,'STALE_REVISION');
+assert.equal(lab.resize({id:'living',width:NaN,height:4,expectedRevision:1}).error,'INVALID_SIZE');
+assert.equal(lab.resize({id:'missing',width:2,height:2,expectedRevision:1}).error,'UNKNOWN_ROOM');
+assert.equal(lab.resize({id:'bedroom',width:8,height:4,expectedRevision:1}).error,'OUTSIDE_PLOT');
+assert.equal(lab.undo().ok,true);assert.equal(lab.snapshot().rooms[0].area,16);assert.equal(lab.snapshot().revision,2);
+assert.equal(lab.undo().error,'NO_HISTORY');lab.reset();assert.equal(lab.snapshot().revision,0);console.log('PASS: resize, area, overlap atomicity, stale revision, invalid size, unknown ID, plot boundary, undo, reset');

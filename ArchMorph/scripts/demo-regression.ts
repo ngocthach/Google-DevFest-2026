@@ -1,0 +1,13 @@
+import assert from 'node:assert/strict';
+import {readFileSync} from 'node:fs';
+import {migrateProject,applyOperation,validateLayout,buildCirculationGraph} from '../src/lib/architecture.ts';
+let p=migrateProject(JSON.parse(readFileSync(new URL('../public/demo-fixtures/sukoon-studio-demo.archmorph.json',import.meta.url),'utf8')).project);
+assert.equal(validateLayout(p).issueCount,0,'Demo must start without findings');
+let result=applyOperation(p,{type:'create_room',floorId:'floor-e0df61af',name:'Creative Studio',roomType:'Office',x:6,y:50,width:10,length:12},'agent');p=result.project;
+const room=result.result.room as {id:string};
+const roomId=room.id;
+p=applyOperation(p,{type:'add_opening',kind:'door',wallId:'wall-floor-e0df61af-h-5000-600-1600',offset:2,width:3},'agent').project;
+p=applyOperation(p,{type:'add_opening',kind:'window',wallId:'wall-floor-e0df61af-v-600-5000-6200',offset:2,width:4,windowType:'casement',operable:true},'agent').project;
+const report=validateLayout(p);assert.equal(report.issueCount,0,JSON.stringify(report.issues));
+assert.ok(!buildCirculationGraph(p).disconnectedRoomIds.includes(roomId),'Creative Studio must be reachable');
+console.log('PASS: demo room, connected door, operable window and whole-project validation');

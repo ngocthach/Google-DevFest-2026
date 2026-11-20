@@ -1,0 +1,13 @@
+import assert from 'node:assert/strict';
+import {createRoomLab} from './core.mjs';
+const lab=createRoomLab();
+const input={id:'study',name:'Study',x:10,y:0,width:2,height:2,expectedRevision:0};
+assert.equal(lab.create({...input,x:0}).error,'OVERLAP');
+assert.equal(lab.create({...input,x:11}).error,'OUTSIDE_PLOT');
+assert.equal(lab.create({...input,expectedRevision:1}).error,'STALE_REVISION');
+assert.equal(lab.snapshot().revision,0);
+assert.equal(lab.create(input).ok,true);
+assert.equal(lab.create({...input,expectedRevision:1}).error,'DUPLICATE_ROOM');
+assert.equal(lab.snapshot().rooms.find(x=>x.id==='study').area,4);
+assert.equal(lab.undo().ok,true);assert.equal(lab.snapshot().revision,2);assert.equal(lab.snapshot().rooms.length,3);
+console.log('PASS: creation, revision, overlap, boundaries, duplicate IDs, undo');

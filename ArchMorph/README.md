@@ -1,0 +1,151 @@
+# ArchMorph
+
+**Explore the home you want to build, with an AI working beside you.**
+
+ArchMorph helps people explore a future family home before taking the concept to a professional architect. Arrange rooms, see the house from outside, walk through it, and keep improving the idea without needing architectural training to begin.
+
+A person and a WebMCP agent work on the same live building model. People draw and inspect spatial ideas visually; agents use named, typed tools to inspect, edit, measure, validate, navigate, and present that exact design. ArchMorph supports early exploration and communication with architects and engineers.
+
+- **Live application:** [archmorph-studio.musfk.chatgpt.site](https://archmorph-studio.musfk.chatgpt.site)
+- **WebMCP Challenge:** [webmcp.devpost.com](https://webmcp.devpost.com/)
+- **Inspiration and product direction:** [docs/INSPIRATION.md](docs/INSPIRATION.md)
+- **Complete showcase home and studio audit:** [Sukoon House](docs/SUKOON_HOUSE_STUDIO_AUDIT_2026-10-10.md)
+- **Detailed product and engineering reference:** [docs/ARCHMORPH_RESEARCH_AND_ROADMAP.md](docs/ARCHMORPH_RESEARCH_AND_ROADMAP.md)
+
+![ArchMorph floor-plan editor](docs/assets/archmorph-plan.png)
+
+## Why WebMCP
+
+Coordinate clicking is fragile in an architectural editor. A small visual error can select the wrong wall, place an opening outside its host, or edit the wrong floor. ArchMorph instead exposes 63 architectural operations through `document.modelContext.registerTool()`.
+
+The landing page is WebMCP-enabled too: an agent can inspect the product surface, control the live model's complete/section presentation and drawing layers, then open the studio through four focused route-scoped tools. Clicking the layer toggles or the section button runs the same four definitions, so the title block above the model attributes each change to the person or the agent. Entering the studio releases that landing catalog and replaces it with the full architectural tool surface.
+
+The agent works with stable floor, room, wall, opening, and stair identifiers. Human actions and WebMCP calls both pass through the same operation pipeline, so they share:
+
+- one canonical project model;
+- topology reconstruction and architectural validation;
+- undo/redo, activity history, versioning, and local persistence; and
+- synchronized SVG plan and Three.js model views.
+
+A representative collaboration loop is:
+
+1. The agent calls `inspect_project`, `inspect_floor`, and `inspect_circulation`.
+2. The person describes a spatial goal.
+3. The agent edits the design with stable IDs and real dimensions.
+4. ArchMorph returns the changed elements and validation evidence.
+5. The person adjusts the result directly in the plan.
+6. The agent re-inspects the shared state, refines it, and presents it in 3D or Walk Mode.
+
+## Current capabilities
+
+- Per-project editable land size, cardinal orientation, setbacks, buildable envelope, coverage, and open-area metrics.
+- Multiple floors with editable storey heights; changing one re-levels every floor above and recomputes connected stair geometry.
+- Edge alignment that latches near-miss geometry onto neighbouring rooms, plot boundaries, setback lines, and stairs, so rooms share one canonical wall instead of leaving slivers.
+- Room overlap prevented at the operation rather than reported afterwards.
+- Rectangular, L-, T-, U-, and custom orthogonal polygon rooms.
+- Canonical walls with connectivity, adjacency, and exterior/interior classification.
+- Hosted doors and windows with handing, operation, and glazing-performance properties.
+- Connected straight, 90° quarter-turn L-shaped, and 180° half-turn U-shaped stairs with explicit flights, landings, entry/exit approaches, true stairwell openings, four plan rotations, and Walk Mode transitions.
+- Exact dimensions, direct manipulation, snapping, selection, and measurement.
+- Circulation graphs with entrance-to-room route evidence.
+- Validation for overlap, plot/setback violations, opening hosts, circulation, and stairs.
+- Habitability review of each room's daylight, natural ventilation, bedroom escape opening, and minimum habitable size.
+- Both centreline and finished carpet areas, ground coverage, open site area, and floor area ratio (FAR/FSI).
+- Local project library, JSON import/export, SVG export, migration, and undo/redo.
+- Synchronized SVG plan, Three.js orbit view, and first-person Walk Mode.
+- Flat roofs with adjustable parapets; balcony/terrace slabs with bounded railing styles; and boundary walls with adjustable gates.
+- Project façade palettes, per-exterior-wall finish overrides, and wall-hosted frames, canopies, and sunshades.
+- Exterior finish presets and conceptual SHGC, VT, and U-factor glazing values.
+
+ArchMorph intentionally focuses on architecture rather than furniture, decoration, cinematic effects, or unvalidated simulation.
+
+## WebMCP tool surface
+
+| Category | Count | Examples |
+| --- | ---: | --- |
+| Inspect | 9 | `inspect_project`, `inspect_floor`, `inspect_exterior`, `inspect_circulation`, `preview_changes` |
+| Edit | 42 | `configure_plot`, `set_floor_height`, `update_room`, `add_balcony`, `set_roof`, `apply_changes` |
+| Calculate and validate | 5 | `calculate_room_area`, `measure_distance`, `validate_layout` |
+| Present | 7 | `switch_view`, `set_active_floor`, `set_camera`, `focus_element`, `take_snapshot` |
+
+The full definitions live in [`src/lib/webmcp-tools.ts`](src/lib/webmcp-tools.ts). Repeatable journeys and the native-client smoke procedure are recorded in [`evals/webmcp-journeys.json`](evals/webmcp-journeys.json) and [`docs/WEBMCP_TESTING.md`](docs/WEBMCP_TESTING.md).
+
+![ArchMorph WebMCP developer view](docs/assets/archmorph-webmcp.png)
+
+## Run locally
+
+### Requirements
+
+- Node.js 22 or newer
+- npm
+
+### Setup
+
+```bash
+git clone https://github.com/Yousafkhanzadaa/ArchMorph.git
+cd ArchMorph
+npm ci
+npm run dev
+```
+
+Open the local URL printed by the development server, normally [http://localhost:3000](http://localhost:3000).
+
+To load the included sample residence, open the project menu, select **Import**, and choose [`fixtures/recovered-modern-house.archmorph.json`](fixtures/recovered-modern-house.archmorph.json).
+
+For a larger two-storey courtyard home, import [`fixtures/sukoon-family-retreat.archmorph.json`](fixtures/sukoon-family-retreat.archmorph.json). [Its design and audit](docs/SUKOON_HOUSE_STUDIO_AUDIT_2026-10-10.md) include plans, cutaways, walkthrough evidence, and reproducible studio findings.
+
+Add `?debug=1` to the local URL only when you need the WebMCP catalog and local tool harness. The normal production interface deliberately keeps engineering controls hidden.
+
+## Verification
+
+```bash
+npm run test:architecture
+npm run test:webmcp
+npm run test:model
+npm run test:studio
+npm run test:walls
+npm run test:audit
+npm run lint
+npm run build
+```
+
+`test:architecture` covers canonical geometry, topology, openings, circulation, straight/L/U stairs, polygonal rooms, exterior systems, per-project sites, persistence, migrations, and spatial collision data. `test:webmcp` checks the 63-tool catalog, schema boundaries, annotations, unique names, human/agent operation parity, inspection payload size, and representative inspection/mutation failures.
+
+The N01–N10 production baseline was verified with ChatGPT desktop 26.825.41651 (build 7345) when the deployed catalog contained 40 tools: N01–N07 and N09–N10 passed, and N08 was N/A because that client exposes no cancellation mechanism. The 51-tool catalog additionally passed native local discovery and representative exterior-system execution on August 30; the current catalog contains 63 tools. See [`docs/WEBMCP_TESTING.md`](docs/WEBMCP_TESTING.md) for the exact records.
+
+The under-three-minute recording plan and narration are ready in [`docs/DEMO_VIDEO_SCRIPT.md`](docs/DEMO_VIDEO_SCRIPT.md).
+
+## Architecture
+
+| Area | Responsibility |
+| --- | --- |
+| [`src/lib/architecture.ts`](src/lib/architecture.ts) | Canonical schema, operations, topology, metrics, circulation, inspection, and validation |
+| [`src/app/components/Studio.tsx`](src/app/components/Studio.tsx) | Product shell, shared commit/history path, persistence, and WebMCP registration |
+| [`src/app/components/FloorPlan.tsx`](src/app/components/FloorPlan.tsx) | Editable SVG plan, selection, dimensions, and snapping |
+| [`src/lib/spatial3d.ts`](src/lib/spatial3d.ts) | Derived wall/opening and collision geometry |
+| [`src/app/components/ModelView.tsx`](src/app/components/ModelView.tsx) | Three.js model, orbit navigation, and Walk Mode |
+| [`src/lib/persistence.ts`](src/lib/persistence.ts) | Local project library, import/export, and schema migration |
+| [`src/lib/webmcp-tools.ts`](src/lib/webmcp-tools.ts) | Typed WebMCP tool catalog |
+| [`src/lib/landing-webmcp-tools.ts`](src/lib/landing-webmcp-tools.ts) | Route-scoped landing inspection, presentation, and navigation tools |
+
+The project uses Next.js 16, React 19, TypeScript, Three.js, SVG, Tailwind CSS, vinext, Vite, and Cloudflare/OpenAI Sites integration.
+
+## Scope and limitations
+
+The [Sukoon House studio audit](docs/SUKOON_HOUSE_STUDIO_AUDIT_2026-10-10.md) records a complete family-home build and its limitations. The [fix report](docs/STUDIO_AUDIT_FIXES_2026-10-11.md) maps each finding to the implementation, verification, or remaining work.
+
+ArchMorph is a concept and schematic-design tool. Its calculations and checks do not constitute BIM authoring, construction documentation, building-code approval, structural engineering, energy certification, permit review, or professional architectural services.
+
+- Canonical project units are currently feet.
+- Persistence is local to the browser; there is no multi-user server project library yet.
+- Stair and circulation findings are early-design guidance with stated assumptions.
+- Glazing presets are conceptual rather than certified product data.
+- WebMCP is an emerging specification, so browser support and API details may change.
+
+## Competition record
+
+ArchMorph was created during The WebMCP Challenge submission period. The timestamped implementation record and evidence paths are in [`docs/COMPETITION_EVIDENCE.md`](docs/COMPETITION_EVIDENCE.md).
+
+## License
+
+Released under the [MIT License](LICENSE).
