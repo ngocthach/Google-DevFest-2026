@@ -21,7 +21,7 @@ Trong RoomLab, kiểm tra **Connection & WebMCP tools** và **ADK connected**, r
 
 ## Các thành phần
 
-Chỉ cần một lệnh khởi động sau lần cài đầu, một trang web và API key. Tool `create_room` tạo phòng theo tọa độ (x, y) từ góc trên trái, tính bằng mét; app từ chối phòng trùng ID, chồng lấn hoặc nằm ngoài khu đất. Có thể undo thao tác tạo phòng. Chatbot có trong trang, không cần cài extension agent riêng. Google ADK chạy ở Python; Gemini quyết định gọi tool; Python gửi yêu cầu tới tab qua WebSocket; tab tìm và thực thi tool thật qua WebMCP; kết quả đi ngược lại cho ADK. Plan và log nằm trong tab và reset khi tải lại. Key chỉ nằm trong biến môi trường của tiến trình server. Không dùng server này trên mạng công cộng.
+Chỉ cần một lệnh khởi động sau lần cài đầu, một trang web và API key. Tool `create_room` tạo phòng theo tọa độ (x, y) từ góc trên trái, tính bằng mét; app từ chối phòng trùng ID, chồng lấn hoặc nằm ngoài khu đất. Có thể undo thao tác tạo phòng. Tool `move_room` di chuyển phòng tới vị trí góc trên trái (x, y) mới, tính bằng mét. Phòng giữ nguyên kích thước và nội thất. App từ chối vị trí chồng lấn hoặc nằm ngoài khu đất, và có thể undo, ví dụ: “Di chuyển Kitchen sang góc dưới bên phải.” Chatbot có trong trang, không cần cài extension agent riêng. Google ADK chạy ở Python; Gemini quyết định gọi tool; Python gửi yêu cầu tới tab qua WebSocket; tab tìm và thực thi tool thật qua WebMCP; kết quả đi ngược lại cho ADK. Plan và log nằm trong tab và reset khi tải lại. Key chỉ nằm trong biến môi trường của tiến trình server. Không dùng server này trên mạng công cộng.
 
 Tài liệu: https://developer.chrome.com/docs/ai/webmcp/imperative-api và https://google.github.io/adk-docs/ .
 

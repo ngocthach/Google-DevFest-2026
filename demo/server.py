@@ -48,6 +48,9 @@ async def chat(socket: WebSocket):
     async def create_room(id: str, name: str, x: float, y: float, width: float, height: float, expectedRevision: int) -> dict:
         """Create a room in metres at (x, y), measured from the top-left. Inspect first and use the latest revision. Rejects overlap or outside the 12 by 10 plot."""
         return await call_browser('create_room', {'id': id, 'name': name, 'x': x, 'y': y, 'width': width, 'height': height, 'expectedRevision': expectedRevision})
+    async def move_room(id: str, x: float, y: float, expectedRevision: int) -> dict:
+        """Move an existing room to a new top-left position (x, y) in metres, keeping its size and furniture. Inspect first for free space and use the latest revision. Rejects overlap or positions outside the 12 by 10 plot."""
+        return await call_browser('move_room', {'id': id, 'x': x, 'y': y, 'expectedRevision': expectedRevision})
     async def place_furniture(roomId: str, kind: str, expectedRevision: int, position: str = 'auto') -> dict:
         """Place furniture to scale in a room. Kinds: sofa, chair, table, desk, bed, bookshelf, plant, lamp. Position: auto, left, center, right. Inspect first and use the current revision. Footprints use preset approximate dimensions in metres; overlaps and out-of-room placements are rejected."""
         return await call_browser('place_furniture', {'roomId':roomId,'kind':kind,'position':position,'expectedRevision':expectedRevision})
@@ -65,7 +68,7 @@ async def chat(socket: WebSocket):
             'current revision, respect errors, and never claim an edit succeeded when rejected. '
             f'Explain results briefly. {DEMO_RESPONSE_LANGUAGE}'
         ),
-        tools=[inspect_plan, resize_room, create_room, place_furniture, move_furniture, undo_last_edit],
+        tools=[inspect_plan, resize_room, create_room, move_room, place_furniture, move_furniture, undo_last_edit],
     )
     runner = InMemoryRunner(agent=agent, app_name='roomlab')
     await runner.session_service.create_session(app_name='roomlab', user_id='local', session_id=session_id)

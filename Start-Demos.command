@@ -10,13 +10,13 @@ if [ ! -x .venv/bin/python ]; then
 fi
 if ! .venv/bin/python -c 'import google.adk, fastapi, uvicorn, dotenv, python_socks' >/dev/null 2>&1; then
   echo 'Installing Python dependencies (first run)...'
-  .venv/bin/python -m pip install -r output/demo/requirements.txt
+  .venv/bin/python -m pip install -r demo/requirements.txt
 fi
 if [ "$mode" != roomlab ] && [ ! -x ArchMorph/node_modules/.bin/vinext ]; then
   echo 'Installing ArchMorph dependencies (first run)...'
   (cd ArchMorph && npm ci --no-audit --no-fund)
 fi
-if ! .venv/bin/python -c 'import sys; sys.path.insert(0,"output/demo"); from config import configure_google_credentials; raise SystemExit(0 if configure_google_credentials() else 1)'; then
+if ! .venv/bin/python -c 'import sys; sys.path.insert(0,"demo"); from config import configure_google_credentials; raise SystemExit(0 if configure_google_credentials() else 1)'; then
   echo 'Enter your Google AI Studio API key (hidden):'
   read -rs GOOGLE_API_KEY; echo; export GOOGLE_API_KEY
   if [ -z "$GOOGLE_API_KEY" ]; then echo 'API key is required.'; exit 1; fi

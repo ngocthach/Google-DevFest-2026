@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';import {createRoomLab} from './core.mjs';
-const lab=createRoomLab();assert.equal(lab.tools.length,4);assert.equal(lab.snapshot().rooms[0].area,16);
+const lab=createRoomLab();assert.deepEqual(lab.tools.map(t=>t.name),['inspect_plan','resize_room','create_room','move_room','place_furniture','move_furniture','undo_last_edit']);assert.equal(lab.snapshot().rooms[0].area,16);
 assert.equal(lab.tools[1].execute({id:'living',width:5,height:4,expectedRevision:0}).room.area,20);
 const before=lab.snapshot();assert.equal(lab.resize({id:'living',width:7,height:4,expectedRevision:1}).error,'OVERLAP');assert.deepEqual(lab.snapshot(),before);
 assert.equal(lab.resize({id:'living',width:5,height:4,expectedRevision:0}).error,'STALE_REVISION');

@@ -1,6 +1,6 @@
 """Local-only ADK bridge; tool calls execute through the connected tab's WebMCP API."""
 import asyncio, json, os, uuid, sys
-sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent.parent / "output/demo"))
+sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent.parent / "demo"))
 from pathlib import Path
 from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -8,6 +8,7 @@ from google.adk.agents import Agent
 from google.adk.runners import InMemoryRunner
 from google.genai import types
 from config import DEMO_RESPONSE_LANGUAGE, get_google_model
+from pending_preview import STORE as PENDING_PREVIEW, INSTRUCTION as PENDING_INSTRUCTION, PREVIEW_TOOLS, normalize_result, is_error
 
 for path in (Path(__file__).parent / '.env', Path(__file__).parent.parent / '.env'):
     load_dotenv(path, override=False)
@@ -26,7 +27,7 @@ async def chat(ws: WebSocket):
     if ws.headers.get('origin') not in {'http://localhost:3000','http://127.0.0.1:3000','http://localhost:3001','http://127.0.0.1:3001'}:
         await ws.close(code=1008);return
     await ws.accept(); pending={}; tasks=set(); lock=asyncio.Lock(); sid=str(uuid.uuid4()); summary_mode=False
-    async def request_browser(name, arguments):
+    async def raw_browser(name, arguments):
         if summary_mode and name not in CORE_READ_TOOLS:
             return {'status':'error','error':'Changes are disabled while preparing the summary.'}
         ident=str(uuid.uuid4()); future=asyncio.get_running_loop().create_future();pending[ident]=future
@@ -36,6 +37,25 @@ async def chat(ws: WebSocket):
         except asyncio.TimeoutError:
             return {'status':'error','error':'Browser did not respond to the tool request.'}
         finally: pending.pop(ident,None)
+    async def request_browser(name, arguments):
+        result = await raw_browser(name, arguments)
+        if name in PREVIEW_TOOLS:
+            await PENDING_PREVIEW.capture(raw_browser, name, arguments, result)
+        elif name == 'apply_changes' and not is_error(normalize_result(result)):
+            PENDING_PREVIEW.clear()
+        return result
+    async def get_pending_preview() -> dict:
+        """Return the layout plan last previewed in chat or voice that is waiting for the user's approval, with its drawing version."""
+        return PENDING_PREVIEW.public()
+    async def apply_pending_preview() -> dict:
+        """Apply the pending previewed plan after the user approves it (e.g. "cứ làm đi"). If the drawing changed since the preview, it is NOT applied; a fresh preview is returned for re-approval."""
+        if summary_mode:
+            return {'status':'error','error':'Changes are disabled while preparing the summary.'}
+        return await PENDING_PREVIEW.apply(raw_browser)
+    async def discard_pending_preview() -> dict:
+        """Discard the pending previewed plan when the user declines or cancels it. Changes nothing in the drawing."""
+        PENDING_PREVIEW.clear()
+        return {'status':'discarded'}
     async def inspect_project() -> dict:
         """Inspect the current project and obtain stable floor IDs and overall validation."""
         return await request_browser('inspect_project', {})
@@ -132,7 +152,7 @@ async def chat(ws: WebSocket):
         'For an expansion of one room use preview_room_growth, never rebalance. '
         'When a tool returns no_complete_plan but alternatives is nonempty, ALWAYS immediately name the best '
         'alternative and speak its before and after area in Vietnamese, then ask whether to apply that alternative. '
-        'When the user approves it, use the exact changes and expectedVersion from that alternative. '
+        'When the user approves it, call apply_pending_preview (it applies the exact previewed changes and version). '
         'ArchMorph area numbers are in square feet. In Vietnamese audio say “feet vuông” after every area number. '
         'Never say “mét vuông” for an unchanged square-foot value. Keep lengths in feet. '
         'Describe upper-floor footprint overlap as modeled geometry. Never say there is a structural problem or that '
@@ -142,7 +162,7 @@ async def chat(ws: WebSocket):
         'For room moves with a delegated position, area percentages, or coordinated shrink/grow requests, '
         'use inspect_floor with summary to resolve IDs, then call propose_room_layout directly. It checks floors and validation. Never ask for x/y when the user delegated placement. '
         'Report the suggested plan and its actual sizes. When requested to make the full edit, apply the best complete '
-        'checked plan by calling apply_changes with its exact expectedVersion and changes. '
+        'checked plan by calling apply_pending_preview, which re-checks the drawing version. '
         'If no complete plan passes, report blockers and offer the best partial alternative; do not apply a partial edit '
         'without separate approval. Do not silently substitute rooms. Distinguish Guest Lounge from Family Living. '
         'Preview multi-step edits with preview_changes and commit them together with apply_changes only if there are no '
@@ -153,7 +173,7 @@ async def chat(ws: WebSocket):
         'wall-floor-e0df61af-h-5000-600-1600 and the new west wall is wall-floor-e0df61af-v-600-5000-6200. '
         'Preview the full batch before applying, inspect its results and then switch view. '
     )
-    agent=Agent(name='archmorph_assistant',model=get_google_model(voice=ws.url.path == '/voice'),instruction=(layout_instruction + 'You are an architectural concept-design assistant in ArchMorph. Inspect before changing the design and use real floor, room and wall IDs from tool results. The tools run in the shared browser page via WebMCP. Only make explicitly requested edits. Before adding, moving, or resizing upper-floor rooms, inspect the floor immediately below and preserve its modeled footprint. If a tool rejects an overhang, report it and do not claim success. Geometric footprint alignment does not establish structural safety. To enter Walk use set_navigation_mode with mode walk; if a named Walk destination is requested, inspect the relevant floor and pass both the exact roomName and the matching roomId to set_navigation_mode; never infer or guess an ID. If the verification fails, inspect again. For ordinary 3D use switch_view with mode 3d, and for Plan use 2d. Create a floor only on explicit request and report the actual result. Work sequentially, inspect wall geometry and existing openings before adding doors or windows; report errors and never invent success. Do not make substitutes unless asked. ArchMorph uses feet. Validation is conceptual, not building-code certification. If the user asks about reachability or circulation, call inspect_circulation before stating a conclusion. Never say you checked circulation unless you actually called inspect_circulation. For the prepared Sukoon House — Studio Demo (terrace removed) only, if the user asks for the Creative Studio demo, the agreed brief is: on First Floor create an Office named Creative Studio at x 6, y 50, width 10 and length 12 feet. If asked for its connecting door, use its shared wall with Bedroom West, 3 feet wide at center offset 2 feet. If asked for its window, use its west exterior wall, casement type, 4 feet wide at center offset 2 feet. Inspect the project and actual walls before each operation. Do not use these demo defaults for other projects or other room names. Only perform each operation after the user asks for it. ' + DEMO_RESPONSE_LANGUAGE),tools=[inspect_project,inspect_floor,inspect_room,inspect_wall,inspect_circulation,validate_layout,create_room,move_room,add_door,add_window,create_floor,set_navigation_mode,switch_view,set_active_floor,focus_element,list_archmorph_tools,run_archmorph_tool,propose_room_layout,rebalance_rooms,preview_room_growth])
+    agent=Agent(name='archmorph_assistant',model=get_google_model(voice=ws.url.path == '/voice'),instruction=(PENDING_INSTRUCTION + layout_instruction + 'You are an architectural concept-design assistant in ArchMorph. Inspect before changing the design and use real floor, room and wall IDs from tool results. The tools run in the shared browser page via WebMCP. Only make explicitly requested edits. Before adding, moving, or resizing upper-floor rooms, inspect the floor immediately below and preserve its modeled footprint. If a tool rejects an overhang, report it and do not claim success. Geometric footprint alignment does not establish structural safety. To enter Walk use set_navigation_mode with mode walk; if a named Walk destination is requested, inspect the relevant floor and pass both the exact roomName and the matching roomId to set_navigation_mode; never infer or guess an ID. If the verification fails, inspect again. For ordinary 3D use switch_view with mode 3d, and for Plan use 2d. Create a floor only on explicit request and report the actual result. Work sequentially, inspect wall geometry and existing openings before adding doors or windows; report errors and never invent success. Do not make substitutes unless asked. ArchMorph uses feet. Validation is conceptual, not building-code certification. If the user asks about reachability or circulation, call inspect_circulation before stating a conclusion. Never say you checked circulation unless you actually called inspect_circulation. For the prepared Sukoon House — Studio Demo (terrace removed) only, if the user asks for the Creative Studio demo, the agreed brief is: on First Floor create an Office named Creative Studio at x 6, y 50, width 10 and length 12 feet. If asked for its connecting door, use its shared wall with Bedroom West, 3 feet wide at center offset 2 feet. If asked for its window, use its west exterior wall, casement type, 4 feet wide at center offset 2 feet. Inspect the project and actual walls before each operation. Do not use these demo defaults for other projects or other room names. Only perform each operation after the user asks for it. ' + DEMO_RESPONSE_LANGUAGE),tools=[inspect_project,inspect_floor,inspect_room,inspect_wall,inspect_circulation,validate_layout,create_room,move_room,add_door,add_window,create_floor,set_navigation_mode,switch_view,set_active_floor,focus_element,list_archmorph_tools,run_archmorph_tool,propose_room_layout,rebalance_rooms,preview_room_growth,get_pending_preview,apply_pending_preview,discard_pending_preview])
     runner=InMemoryRunner(agent=agent,app_name='archmorph_demo');await runner.session_service.create_session(app_name='archmorph_demo',user_id='local',session_id=sid)
     if ws.url.path == '/voice':
         from voice_live import run_voice

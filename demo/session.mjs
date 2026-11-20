@@ -1,4 +1,4 @@
-import {createRoomLab} from './core.mjs?v=furniture6';
+import {createRoomLab} from './core.mjs?v=moveroom7';
 export const chapters=[
  {eyebrow:'01 / DELEGATE',title:'Ask for more space',goal:'The agent changes the actual plan.',lesson:'A tool call updates the app you can see.',prompt:'Inspect the current plan. Resize living to 5 × 4 metres using the current revision. Keep every other room unchanged. Report the result, then inspect again to verify the saved plan.',action:'Agent resize',before:'4 × 4 m · 16 m²',after:'5 × 4 m · 20 m²'},
  {eyebrow:'02 / COLLABORATE',title:'Change your mind',goal:'You edit. The agent notices.',lesson:'Reading the current app state beats remembering an old chat.',prompt:'Inspect the plan again. Report the current living room dimensions, area and revision. Do not change anything.',action:'Agent readback',before:'5 × 4 m · 20 m²',after:'5 × 5 m · 25 m²'},
@@ -14,6 +14,7 @@ export function createSession(onChange=()=>{}){
   if(name==='inspect_plan')result=lab.snapshot();
   else if(name==='resize_room')result=lab.resize(input,source);
   else if(name==='create_room')result=lab.create(input,source);
+  else if(name==='move_room')result=lab.move(input,source);
   else if(name==='place_furniture')result=lab.placeFurniture(input,source);
   else if(name==='move_furniture')result=lab.moveFurniture(input,source);
   else if(name==='undo_last_edit')result=lab.undo(source);

@@ -13,7 +13,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 PYTHON = ROOT / '.venv/bin/python'
 SERVICES = (
-    ('RoomLab', 8766, [str(PYTHON), '-m', 'uvicorn', 'server:app', '--host', '127.0.0.1', '--port', '8766', '--loop', 'asyncio'], ROOT / 'output/demo'),
+    ('RoomLab', 8766, [str(PYTHON), '-m', 'uvicorn', 'server:app', '--host', '127.0.0.1', '--port', '8766', '--loop', 'asyncio'], ROOT / 'demo'),
     ('ArchMorph ADK', 8767, [str(PYTHON), '-m', 'uvicorn', 'adk_bridge:app', '--host', '127.0.0.1', '--port', '8767', '--loop', 'asyncio'], ROOT / 'ArchMorph'),
     ('ArchMorph', 3001, ['npm', 'run', 'dev', '--', '--port', '3001', '--hostname', '127.0.0.1'], ROOT / 'ArchMorph'),
 )
