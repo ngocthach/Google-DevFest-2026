@@ -18,6 +18,23 @@ if not os.getenv('GOOGLE_API_KEY') and os.getenv('GOOGLE_AI_API_KEY'):
 from gemini_network import configure_gemini_network
 configure_gemini_network()
 
+ROOM_TYPE_WORDS = (('ensuite','Bathroom'),('bath','Bathroom'),('wc','Bathroom'),('tắm','Bathroom'),('vệ sinh','Bathroom'),
+    ('game','Living Room'),('karaoke','Living Room'),('giải trí','Living Room'),('chơi','Living Room'),('rạp','Living Room'),('study','Office'),('office','Office'),('làm việc','Office'),('lounge','Living Room'),('living','Living Room'),('khách','Living Room'),
+    ('kitchen','Kitchen'),('bếp','Kitchen'),('dining','Dining Room'),('ăn','Dining Room'),('storage','Storage'),('kho','Storage'),
+    ('closet','Storage'),('bed','Bedroom'),('ngủ','Bedroom'))
+def guess_room_type(name):
+    lowered = name.casefold()
+    return next((kind for word, kind in ROOM_TYPE_WORDS if word in lowered), 'Bedroom')
+FLOOR_HINT = ('Do not retry this single edit. Upper-floor rooms need a door to a connected room and must sit over the floor below. '
+              'For an empty upper floor or one that still has free space, call propose_floor_rooms with the floor ID (and the room names, '
+              'fill=true to fill the floor), present the plan, and apply it with apply_pending_preview after approval. '
+              'Call inspect_floor_space to see how much free area is left and where.')
+def with_floor_hint(result):
+    payload = normalize_result(result)
+    text = json.dumps(payload) if isinstance(payload, (dict, list)) else str(payload)
+    if is_error(payload) and any(code in text for code in ('DISCONNECTED_CIRCULATION', 'INVALID_STAIR_CONNECTION', 'footprint below')):
+        return {**(payload if isinstance(payload, dict) else {'status': 'error', 'error': text}), 'nextStep': FLOOR_HINT}
+    return result
 CORE_READ_TOOLS = {'inspect_project','inspect_floor','inspect_circulation','inspect_room','inspect_wall','validate_layout','__discover__'}
 app=FastAPI()
 
@@ -76,7 +93,7 @@ async def chat(ws: WebSocket):
         return await request_browser('validate_layout', {})
     async def create_room(floorId: str, name: str, roomType: str, x: float, y: float, width: float, length: float) -> dict:
         """Create an explicitly requested room in feet. roomType is one of Living Room, Kitchen, Bedroom, Bathroom, Garage, Office, Dining Room, Storage, Courtyard, Custom. Obtain floor ID from inspection."""
-        return await request_browser('create_room', {'floorId':floorId,'name':name,'roomType':roomType,'x':x,'y':y,'width':width,'length':length})
+        return with_floor_hint(await request_browser('create_room', {'floorId':floorId,'name':name,'roomType':roomType,'x':x,'y':y,'width':width,'length':length}))
     async def move_room(roomId: str, x: float, y: float) -> dict:
         """Move an existing room to exact x/y in feet. Inspect the room and lower floor first. The app rejects overlap, out-of-plot edits and moves that worsen upper-floor overhang."""
         return await request_browser('move_room', {'roomId':roomId,'x':x,'y':y})
@@ -133,7 +150,19 @@ async def chat(ws: WebSocket):
             return {'status': 'error', 'error': 'arguments_json must contain a valid JSON object.'}
         if not isinstance(args, dict) or not name or name.startswith('__'):
             return {'status': 'error', 'error': 'Supply a native Studio tool name and a JSON object.'}
-        return await request_browser(name, args)
+        result = await request_browser(name, args)
+        return with_floor_hint(result) if name in ('create_room','add_stairs') else result
+    async def propose_floor_rooms(floorId: str, roomNames: str = '', roomCount: int = 2, fill: bool = False) -> dict:
+        """Plan rooms for an upper floor as one tested batch. Works on an EMPTY upper floor (stacked stair, Upper Landing, rooms, doors) and on a floor that already has rooms (fills free space over the floor below, a door to a connected room each, adding an Upper Hall when needed). Read-only. roomNames is optional and comma-separated, e.g. "Game Room, Kitchen, Karaoke Room"; otherwise roomCount default rooms are chosen. fill=true also fills every remaining free spot ("lấp đầy tầng"). Sizes come from the free space; never ask the user for sizes. Present the result, then on approval call apply_pending_preview."""
+        args = {'floorId': floorId}
+        names = [n.strip() for n in roomNames.split(',') if n.strip()][:8]
+        if names: args['rooms'] = [{'name': n, 'roomType': guess_room_type(n)} for n in names]
+        else: args['roomCount'] = max(1, min(8, int(roomCount or 2)))
+        if fill: args['fill'] = True
+        return await request_browser('propose_floor_rooms', args)
+    async def inspect_floor_space(floorId: str) -> dict:
+        """Read-only. Free area left on an upper floor over the floor below: used, free, free by side (left/right/top/bottom in plan view) and each free spot. Use for "còn trống bao nhiêu", "bên phải còn bao nhiêu diện tích"."""
+        return await request_browser('inspect_floor_space', {'floorId': floorId})
     async def propose_room_layout(roomId: str, goal: str, areaPercent: float = 20, neighborRoomId: str = '') -> dict:
         """Read-only geometry search. Goals: move without coordinates, shrink or grow by areaPercent, or rebalance (shrink roomId and grow neighborRoomId). Returns tested plans and separately approvable partial alternatives."""
         args = {'roomId':roomId,'goal':goal,'areaPercent':areaPercent}
@@ -147,6 +176,17 @@ async def chat(ws: WebSocket):
         """Preview expanding just the named room. Use when the user asks to grow a single room. Do not select a donor room."""
         return await propose_room_layout(roomId, 'grow', areaPercent)
     layout_instruction = (
+        'NEW FLOOR: to add rooms to a new or empty upper floor, call create_floor only if the floor does not exist yet '
+        '(inspect_project first; reuse an existing empty floor), then call propose_floor_rooms with that floor ID. '
+        'MORE ROOMS ON AN UPPER FLOOR: when the user wants to add rooms to, or fill, an upper floor that already has rooms, '
+        'call propose_floor_rooms with that floor ID, roomNames from the request and fill=true if they want the floor full. '
+        'Do not ask for sizes or room types: the planner sizes rooms from the free space. '
+        'When the user asks how much space is free (on a side or overall), call inspect_floor_space and answer with its numbers. '
+        'Never build upper-floor rooms with single create_room or add_stairs calls: they are rejected as disconnected or overhanging. '
+        'Report the proposed rooms with their sizes (and the stair, if any) and what stays free, ask for approval, then call apply_pending_preview. '
+        'HONESTY: never say you are doing, designing or will do something unless you call the tool in this same turn. '
+        'After every edit tool, read its result; if status is error, tell the user the exact reason in Vietnamese and do not '
+        'claim progress. Only say rooms were added after a successful result. '
         'HIGHEST PRIORITY FOR LAYOUT: if the user names two rooms and asks to reduce one and expand the other, '
         'call rebalance_rooms with both IDs before answering. A blocked shrink alone does not answer the expansion request. '
         'For an expansion of one room use preview_room_growth, never rebalance. '
@@ -173,7 +213,7 @@ async def chat(ws: WebSocket):
         'wall-floor-e0df61af-h-5000-600-1600 and the new west wall is wall-floor-e0df61af-v-600-5000-6200. '
         'Preview the full batch before applying, inspect its results and then switch view. '
     )
-    agent=Agent(name='archmorph_assistant',model=get_google_model(voice=ws.url.path == '/voice'),instruction=(PENDING_INSTRUCTION + layout_instruction + 'You are an architectural concept-design assistant in ArchMorph. Inspect before changing the design and use real floor, room and wall IDs from tool results. The tools run in the shared browser page via WebMCP. Only make explicitly requested edits. Before adding, moving, or resizing upper-floor rooms, inspect the floor immediately below and preserve its modeled footprint. If a tool rejects an overhang, report it and do not claim success. Geometric footprint alignment does not establish structural safety. To enter Walk use set_navigation_mode with mode walk; if a named Walk destination is requested, inspect the relevant floor and pass both the exact roomName and the matching roomId to set_navigation_mode; never infer or guess an ID. If the verification fails, inspect again. For ordinary 3D use switch_view with mode 3d, and for Plan use 2d. Create a floor only on explicit request and report the actual result. Work sequentially, inspect wall geometry and existing openings before adding doors or windows; report errors and never invent success. Do not make substitutes unless asked. ArchMorph uses feet. Validation is conceptual, not building-code certification. If the user asks about reachability or circulation, call inspect_circulation before stating a conclusion. Never say you checked circulation unless you actually called inspect_circulation. For the prepared Sukoon House — Studio Demo (terrace removed) only, if the user asks for the Creative Studio demo, the agreed brief is: on First Floor create an Office named Creative Studio at x 6, y 50, width 10 and length 12 feet. If asked for its connecting door, use its shared wall with Bedroom West, 3 feet wide at center offset 2 feet. If asked for its window, use its west exterior wall, casement type, 4 feet wide at center offset 2 feet. Inspect the project and actual walls before each operation. Do not use these demo defaults for other projects or other room names. Only perform each operation after the user asks for it. ' + DEMO_RESPONSE_LANGUAGE),tools=[inspect_project,inspect_floor,inspect_room,inspect_wall,inspect_circulation,validate_layout,create_room,move_room,add_door,add_window,create_floor,set_navigation_mode,switch_view,set_active_floor,focus_element,list_archmorph_tools,run_archmorph_tool,propose_room_layout,rebalance_rooms,preview_room_growth,get_pending_preview,apply_pending_preview,discard_pending_preview])
+    agent=Agent(name='archmorph_assistant',model=get_google_model(voice=ws.url.path == '/voice'),instruction=(PENDING_INSTRUCTION + layout_instruction + 'You are an architectural concept-design assistant in ArchMorph. Inspect before changing the design and use real floor, room and wall IDs from tool results. The tools run in the shared browser page via WebMCP. Only make explicitly requested edits. Before adding, moving, or resizing upper-floor rooms, inspect the floor immediately below and preserve its modeled footprint. If a tool rejects an overhang, report it and do not claim success. Geometric footprint alignment does not establish structural safety. To enter Walk use set_navigation_mode with mode walk; if a named Walk destination is requested, inspect the relevant floor and pass both the exact roomName and the matching roomId to set_navigation_mode; never infer or guess an ID. If the verification fails, inspect again. For ordinary 3D use switch_view with mode 3d, and for Plan use 2d. Create a floor only on explicit request and report the actual result. Work sequentially, inspect wall geometry and existing openings before adding doors or windows; report errors and never invent success. Do not make substitutes unless asked. ArchMorph uses feet. Validation is conceptual, not building-code certification. If the user asks about reachability or circulation, call inspect_circulation before stating a conclusion. Never say you checked circulation unless you actually called inspect_circulation. For the prepared Sukoon House — Studio Demo (terrace removed) only, if the user asks for the Creative Studio demo, the agreed brief is: on First Floor create an Office named Creative Studio at x 6, y 50, width 10 and length 12 feet. If asked for its connecting door, use its shared wall with Bedroom West, 3 feet wide at center offset 2 feet. If asked for its window, use its west exterior wall, casement type, 4 feet wide at center offset 2 feet. Inspect the project and actual walls before each operation. Do not use these demo defaults for other projects or other room names. Only perform each operation after the user asks for it. ' + DEMO_RESPONSE_LANGUAGE),tools=[inspect_project,inspect_floor,inspect_room,inspect_wall,inspect_circulation,validate_layout,create_room,move_room,add_door,add_window,create_floor,set_navigation_mode,switch_view,set_active_floor,focus_element,list_archmorph_tools,run_archmorph_tool,propose_room_layout,rebalance_rooms,preview_room_growth,propose_floor_rooms,inspect_floor_space,get_pending_preview,apply_pending_preview,discard_pending_preview])
     runner=InMemoryRunner(agent=agent,app_name='archmorph_demo');await runner.session_service.create_session(app_name='archmorph_demo',user_id='local',session_id=sid)
     if ws.url.path == '/voice':
         from voice_live import run_voice

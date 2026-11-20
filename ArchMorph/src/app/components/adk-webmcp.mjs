@@ -28,12 +28,27 @@ export async function executeArchMorphRequest(name, args, log) {
   if (!tool) throw new Error(`WebMCP tool is not registered: ${name}`);
   log(name + ' ' + JSON.stringify(args));
   const result = await api.executeTool(tool, args);
+  const text = result?.content?.find(block => block.type === 'text')?.text;
+  let payload = result;
+  if (text || typeof result === 'string') {
+    try { payload = JSON.parse(text ?? result); } catch { payload = { text: text ?? result }; }
+  }
+  // Studio returns rejected edits as {status:"error"} instead of throwing; show them so failures are visible.
+  if (payload?.status === 'error' || result?.isError) {
+    log(`✗ ${name} bị từ chối: ${String(payload?.error ?? payload?.text ?? 'lỗi không rõ').slice(0, 220)}`);
+  }
+  if (name === 'propose_floor_rooms') {
+    const option = payload?.options?.[0];
+    const rooms = option?.affectedRooms.map(room => `${room.name} ${room.afterArea} ft²`).join(' · ');
+    if (option?.stair) log(`Xem trước tầng mới · ${rooms} · cầu thang từ ${option.stair.from} · ${option.errors} lỗi`);
+    else if (option) log(`Xem trước thêm phòng · ${rooms} · còn trống ${payload.freeAreaAfter} ft² · ${option.errors} lỗi`);
+    else if (payload?.blockers?.length) log(`Không có phương án tầng mới: ${payload.blockers[0]}`);
+  }
+  if (name === 'inspect_floor_space' && payload?.freeSpots) {
+    log(`Diện tích trống ${payload.floor.name}: ${payload.freeArea} / ${payload.footprintBelowArea} ft² · ${Object.entries(payload.freeAreaBySide ?? {}).map(([side, area]) => `${side} ${area}`).join(' · ')}`);
+  }
   if (name === 'propose_room_layout') {
-    const text = result?.content?.find(block => block.type === 'text')?.text;
-    let proposal = result;
-    if (text || typeof result === 'string') {
-      try { proposal = JSON.parse(text ?? result); } catch { /* Use the original tool result. */ }
-    }
+    const proposal = payload;
     const preview = proposal?.options?.[0] ?? proposal?.alternatives?.[0];
     if (preview) {
       const areas = preview.affectedRooms

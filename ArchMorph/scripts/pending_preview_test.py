@@ -77,6 +77,47 @@ async def main():
     assert out['status'] == 'applied' and (await browser('__state__', {}))['rooms']['Garden Study']['area'] == 126, out
     print('PASS preview_changes batch captured and applied')
 
+    # 5. New floor: single edits deadlock (room disconnected / stair lands nowhere); the planner's batch applies.
+    await browser('__reset__', {})
+    floor = normalize_result(await browser('create_floor', {'height': 9, 'name': 'Second Floor'}))['floor']['id']
+    single = normalize_result(await browser('create_room', {'floorId': floor, 'name': 'Master Bedroom', 'roomType': 'Bedroom', 'x': 20, 'y': 18, 'width': 12, 'length': 12}))
+    assert single.get('status') == 'error' and 'DISCONNECTED_CIRCULATION' in single['error'], single
+    stair = normalize_result(await browser('add_stairs', {'direction': 'up', 'floorId': 'floor-e0df61af', 'landingDepth': 3.5, 'length': 8, 'rotation': 180, 'stairType': 'u-shaped', 'turnSide': 'right', 'width': 3.5, 'x': 33, 'y': 34}))
+    assert stair.get('status') == 'error' and 'INVALID_STAIR_CONNECTION' in stair['error'], stair
+    args = {'floorId': floor, 'rooms': [{'name': 'Master Bedroom', 'roomType': 'Bedroom'}, {'name': 'Master Ensuite', 'roomType': 'Bathroom'}]}
+    plan = await store.capture(browser, 'propose_floor_rooms', args, await browser('propose_floor_rooms', args))
+    assert plan and plan['kind'] == 'complete', plan
+    assert [r['name'] for r in plan['rooms']] == ['Upper Landing', 'Master Bedroom', 'Master Ensuite'], plan['rooms']
+    print('PASS new floor planned:', plan['summaryVi'])
+    before = (await browser('__state__', {}))['version']
+    out = await store.apply(browser)
+    state = await browser('__state__', {})
+    assert out['status'] == 'applied' and state['version'] == before + 1, out
+    assert {'Upper Landing', 'Master Bedroom', 'Master Ensuite'} <= set(state['rooms'])
+    validation = normalize_result(await browser('validate_layout', {}))
+    assert validation['errors'] == 0, validation
+    print('PASS new floor applied as one version with 0 layout errors')
+
+    # 6. Floor that already has rooms: free space is reported, and named rooms + fill are planned as one batch.
+    space = normalize_result(await browser('inspect_floor_space', {'floorId': floor}))
+    assert space['freeArea'] > 0 and space['freeSpots'] and space['freeAreaBySide'], space
+    args = {'floorId': floor, 'rooms': [{'name': 'Game Room', 'roomType': 'Living Room'}, {'name': 'Kitchen', 'roomType': 'Kitchen'},
+                                        {'name': 'Karaoke Room', 'roomType': 'Living Room'}], 'fill': True}
+    plan = await store.capture(browser, 'propose_floor_rooms', args, await browser('propose_floor_rooms', args))
+    assert plan and plan['kind'] == 'complete', plan
+    names = [r['name'] for r in plan['rooms']]
+    assert names[:3] == ['Game Room', 'Kitchen', 'Karaoke Room'], names
+    print('PASS extend floor planned:', plan['summaryVi'])
+    before = (await browser('__state__', {}))['version']
+    out = await store.apply(browser)
+    state = await browser('__state__', {})
+    assert out['status'] == 'applied' and state['version'] == before + 1, out
+    assert set(names) <= set(state['rooms']), state['rooms']
+    assert normalize_result(await browser('validate_layout', {}))['errors'] == 0
+    after = normalize_result(await browser('inspect_floor_space', {'floorId': floor}))
+    assert after['freeArea'] < space['freeArea'], (space['freeArea'], after['freeArea'])
+    print(f"PASS extend floor applied: free area {space['freeArea']} -> {after['freeArea']} ft², 0 layout errors")
+
 try:
     asyncio.run(main())
 finally:

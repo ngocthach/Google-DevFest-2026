@@ -1,0 +1,1332 @@
+import { assertNoNewDesignIssues, floorFreeSpace, proposeFloorRooms, proposeRoomLayout } from "./agent-room-layout.ts";
+import { assertToolInput } from "./tool-input.ts";
+import {
+  roomTypes,
+  applyOperation,
+  cloneProject,
+  type ArchitectureOperation,
+  type CameraPreset,
+  type OperationOutcome,
+  type PointRef,
+  type Project,
+  type RoomType,
+  type RoomShape,
+  type StairRotation,
+  type StairType,
+  type StairTurnSide,
+  type ExteriorFinishId,
+  type FacadeFeatureKind,
+  type RailingStyle,
+  type WallSide,
+  type ValidationReport,
+  buildCirculationGraph,
+  inspectFloor,
+  inspectOpening,
+  inspectRoom,
+  inspectWall,
+  measureDistance,
+  projectInspection,
+  projectMetrics,
+  roomArea,
+  roomCarpetArea,
+  validateLayout,
+} from "./architecture.ts";
+
+export type ToolRuntime = {
+  getProject: () => Project;
+  perform: (operation: ArchitectureOperation) => OperationOutcome;
+  captureSnapshot: (options?: { download?: boolean; signal?: AbortSignal }) => Promise<Record<string, unknown>>;
+  exportPlan: (format: "json" | "svg", download?: boolean, signal?: AbortSignal) => Record<string, unknown>;
+  noteActivity: (description: string, operation: string) => void;
+};
+
+export type ArchMorphTool = WebMCPToolDefinition & {
+  category: "inspect" | "edit" | "calculate" | "present";
+};
+
+const emptyObject = {
+  type: "object",
+  properties: {},
+  additionalProperties: false,
+};
+
+const floorId = {
+  type: "string",
+  description: "Stable floor identifier returned by inspect_project.",
+};
+
+const roomId = {
+  type: "string",
+  description: "Stable room identifier returned by inspect_floor or create_room.",
+};
+
+const wallId = {
+  type: "string",
+  description: "Stable wall identifier returned by inspect_floor, inspect_room, or add_wall.",
+};
+
+const openingId = {
+  type: "string",
+  description: "Stable door or window identifier returned by inspect_floor.",
+};
+
+function requiredString(input: Record<string, unknown>, key: string) {
+  const value = input[key];
+  if (typeof value !== "string" || !value.trim()) throw new Error(`${key} is required.`);
+  return value;
+}
+
+function requiredNumber(input: Record<string, unknown>, key: string) {
+  const value = input[key];
+  if (typeof value !== "number" || !Number.isFinite(value)) throw new Error(`${key} must be a number with a finite value.`);
+  return value;
+}
+
+function optionalNumber(input: Record<string, unknown>, key: string) {
+  const value = input[key];
+  if (value === undefined) return undefined;
+  if (typeof value !== "number" || !Number.isFinite(value)) throw new Error(`${key} must be a number with a finite value.`);
+  return value;
+}
+
+function optionalString(input: Record<string, unknown>, key: string) {
+  const value = input[key];
+  if (value === undefined) return undefined;
+  if (typeof value !== "string") throw new Error(`${key} must be a string.`);
+  return value;
+}
+
+function optionalBoolean(input: Record<string, unknown>, key: string) {
+  const value = input[key];
+  if (value === undefined) return undefined;
+  if (typeof value !== "boolean") throw new Error(`${key} must be true or false.`);
+  return value;
+}
+
+function optionalStringArray(input: Record<string, unknown>, key: string) {
+  const value = input[key];
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value) || value.some((item) => typeof item !== "string")) throw new Error(`${key} must be an array of strings.`);
+  return value as string[];
+}
+
+function pointReference(input: unknown, label: string): PointRef {
+  if (!input || typeof input !== "object") throw new Error(`${label} must be a coordinate or element reference.`);
+  const value = input as Record<string, unknown>;
+  if (typeof value.elementId === "string") {
+    return {
+      elementId: value.elementId,
+      anchor: value.anchor as "center" | "start" | "end" | undefined,
+    };
+  }
+  if (typeof value.x === "number" && typeof value.y === "number") return { x: value.x, y: value.y };
+  throw new Error(`${label} requires either elementId or x and y coordinates.`);
+}
+
+const readOnly = { readOnlyHint: true };
+
+export function createArchMorphTools(runtime: ToolRuntime): ArchMorphTool[] {
+  const tools: ArchMorphTool[] = [
+    {
+      name: "inspect_project",
+      category: "inspect",
+      description:
+        "Inspect the complete live ArchMorph project: plot, floors, element counts, current metrics, view state, and validation summary. Call this before planning edits.",
+      inputSchema: emptyObject,
+      annotations: readOnly,
+      execute: () => projectInspection(runtime.getProject()),
+    },
+    {
+      name: "inspect_plot",
+      category: "inspect",
+      description:
+        "Inspect the live plot dimensions, setbacks, buildable envelope, available area, orientation, and current ground-floor coverage.",
+      inputSchema: emptyObject,
+      annotations: readOnly,
+      execute: () => {
+        const project = runtime.getProject();
+        return { plot: project.plot, metrics: projectMetrics(project), unit: project.unit };
+      },
+    },
+    {
+      name: "configure_plot",
+      category: "edit",
+      description: "Configure this project's editable land width, length, setbacks, and front-edge orientation in one canonical transaction. Omitted fields remain unchanged.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          width: { type: "number", minimum: 15 }, length: { type: "number", minimum: 15 },
+          orientation: { type: "string", enum: ["North", "East", "South", "West"] },
+          frontSetback: { type: "number", minimum: 0 }, rearSetback: { type: "number", minimum: 0 },
+          leftSetback: { type: "number", minimum: 0 }, rightSetback: { type: "number", minimum: 0 },
+        },
+        additionalProperties: false,
+      },
+      execute: (input) => runtime.perform({
+        type: "set_plot",
+        width: optionalNumber(input, "width"), length: optionalNumber(input, "length"),
+        orientation: optionalString(input, "orientation") as Project["plot"]["orientation"] | undefined,
+        setbacks: {
+          ...(input.frontSetback !== undefined ? { front: requiredNumber(input, "frontSetback") } : {}),
+          ...(input.rearSetback !== undefined ? { rear: requiredNumber(input, "rearSetback") } : {}),
+          ...(input.leftSetback !== undefined ? { left: requiredNumber(input, "leftSetback") } : {}),
+          ...(input.rightSetback !== undefined ? { right: requiredNumber(input, "rightSetback") } : {}),
+        },
+      }).result,
+    },
+    {
+      name: "rename_project",
+      category: "edit",
+      description: "Rename the live project. The new name appears in the product header and in every subsequent export filename.",
+      inputSchema: {
+        type: "object",
+        properties: { name: { type: "string", minLength: 1, maxLength: 120, description: "Visible project name." } },
+        required: ["name"],
+        additionalProperties: false,
+      },
+      execute: (input) => runtime.perform({ type: "rename_project", name: requiredString(input, "name") }).result,
+    },
+    {
+      name: "inspect_exterior",
+      category: "inspect",
+      description: "Inspect the flat roof, parapet, site boundary, gate, balconies, terraces, façade features, and per-wall material overrides in the live project.",
+      inputSchema: emptyObject,
+      annotations: readOnly,
+      execute: () => {
+        const project = runtime.getProject();
+        return {
+          roof: project.roof,
+          siteBoundary: project.siteBoundary,
+          balconies: project.balconies,
+          facadeFeatures: project.facadeFeatures,
+          wallFinishOverrides: project.walls.filter((wall) => wall.exterior && wall.finish).map((wall) => ({ wallId: wall.id, finish: wall.finish })),
+          projectDefaultFinish: project.exteriorFinish,
+        };
+      },
+    },
+    {
+      name: "inspect_floor",
+      category: "inspect",
+      description:
+        "Inspect the rooms, walls, doors, windows, stairs, areas, and findings on one floor. Returns a compact summary by default; ask for full detail only when you need wall connectivity or stair layout geometry.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          floorId,
+          detail: { type: "string", enum: ["summary", "full"], default: "summary", description: "summary keeps every stable ID and dimension; full adds derived geometry." },
+        },
+        required: ["floorId"],
+        additionalProperties: false,
+      },
+      annotations: readOnly,
+      execute: (input) => inspectFloor(
+        runtime.getProject(),
+        requiredString(input, "floorId"),
+        input.detail === "full" ? "full" : "summary",
+      ),
+    },
+    {
+      name: "set_plot_orientation",
+      category: "edit",
+      description:
+        "Set the cardinal direction faced by the plot's front/access edge. The site plan and north arrow update immediately without changing plot dimensions or setbacks.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          orientation: {
+            type: "string",
+            enum: ["North", "East", "South", "West"],
+            description: "Cardinal direction faced by the front/access edge of the plot.",
+          },
+        },
+        required: ["orientation"],
+        additionalProperties: false,
+      },
+      execute: (input) => runtime.perform({
+        type: "set_plot_orientation",
+        orientation: requiredString(input, "orientation") as Project["plot"]["orientation"],
+      }).result,
+    },
+    {
+      name: "inspect_room",
+      category: "inspect",
+      description:
+        "Inspect one room's exact geometry, area, perimeter, boundary walls, openings, and directly adjacent rooms.",
+      inputSchema: {
+        type: "object",
+        properties: { roomId },
+        required: ["roomId"],
+        additionalProperties: false,
+      },
+      annotations: readOnly,
+      execute: (input) => inspectRoom(runtime.getProject(), requiredString(input, "roomId")),
+    },
+    {
+      name: "inspect_wall",
+      category: "inspect",
+      description: "Inspect one canonical physical wall, its endpoints, length, exterior/interior status, adjacent rooms, connected wall segments, and hosted openings.",
+      inputSchema: { type: "object", properties: { wallId }, required: ["wallId"], additionalProperties: false },
+      annotations: readOnly,
+      execute: (input) => inspectWall(runtime.getProject(), requiredString(input, "wallId")),
+    },
+    {
+      name: "inspect_opening",
+      category: "inspect",
+      description: "Inspect one door or window together with its full architectural configuration and canonical host wall.",
+      inputSchema: { type: "object", properties: { openingId }, required: ["openingId"], additionalProperties: false },
+      annotations: readOnly,
+      execute: (input) => inspectOpening(runtime.getProject(), requiredString(input, "openingId")),
+    },
+    {
+      name: "inspect_circulation",
+      category: "inspect",
+      description: "Inspect the traversable room graph, main entrance, room-to-room door edges, stair edges, unreachable rooms, and invalid circulation elements.",
+      inputSchema: emptyObject,
+      annotations: readOnly,
+      execute: () => buildCirculationGraph(runtime.getProject()),
+    },
+    {
+      name: "create_room",
+      category: "edit",
+      description:
+        "Create one rectangular, L-, T-, or U-shaped residential room on a floor using real dimensions in feet. Its canonical boundary walls appear immediately in the shared editor.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          floorId,
+          name: { type: "string", description: "Visible room name, such as Bedroom 2." },
+          roomType: {
+            type: "string",
+            enum: ["Living Room", "Kitchen", "Bedroom", "Bathroom", "Garage", "Office", "Dining Room", "Storage", "Courtyard", "Custom"],
+          },
+          x: { type: "number", description: "Horizontal position in feet from the plot's left edge." },
+          y: { type: "number", description: "Position in feet from the front plot boundary." },
+          width: { type: "number", minimum: 3, description: "Room width in feet." },
+          length: { type: "number", minimum: 3, description: "Room length in feet." },
+          shape: { type: "string", enum: ["rectangle", "l-shape", "t-shape", "u-shape"], default: "rectangle", description: "Lightweight orthogonal footprint preset." },
+        },
+        required: ["floorId", "name", "roomType", "x", "y", "width", "length"],
+        additionalProperties: false,
+      },
+      execute: (input) => runtime.perform({
+        type: "create_room",
+        floorId: requiredString(input, "floorId"),
+        name: requiredString(input, "name"),
+        roomType: requiredString(input, "roomType") as RoomType,
+        x: requiredNumber(input, "x"),
+        y: requiredNumber(input, "y"),
+        width: requiredNumber(input, "width"),
+        length: requiredNumber(input, "length"),
+        shape: optionalString(input, "shape") as Exclude<RoomShape, "custom"> | undefined,
+      }).result,
+    },
+    {
+      name: "create_polygon_room",
+      category: "edit",
+      description: "Create a custom orthogonal room from 4–12 ordered plan vertices. Edges must be horizontal or vertical and cannot cross.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          floorId,
+          name: { type: "string" },
+          roomType: { type: "string", enum: ["Living Room", "Kitchen", "Bedroom", "Bathroom", "Garage", "Office", "Dining Room", "Storage", "Courtyard", "Custom"] },
+          vertices: { type: "array", minItems: 4, maxItems: 12, items: { type: "object", properties: { x: { type: "number" }, y: { type: "number" } }, required: ["x", "y"], additionalProperties: false } },
+        },
+        required: ["floorId", "name", "roomType", "vertices"],
+        additionalProperties: false,
+      },
+      execute: (input) => {
+        if (!Array.isArray(input.vertices)) throw new Error("vertices must be an array.");
+        const vertices = input.vertices.map((item) => {
+          if (!item || typeof item !== "object") throw new Error("Each vertex requires x and y coordinates.");
+          const point = item as Record<string, unknown>;
+          return { x: requiredNumber(point, "x"), y: requiredNumber(point, "y") };
+        });
+        return runtime.perform({ type: "create_polygon_room", floorId: requiredString(input, "floorId"), name: requiredString(input, "name"), roomType: requiredString(input, "roomType") as RoomType, vertices }).result;
+      },
+    },
+    {
+      name: "move_room",
+      category: "edit",
+      description:
+        "Move one existing room to an exact x/y position in feet. Its walls, openings, metrics, 2D plan, and 3D model update from the same transaction.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          roomId,
+          x: { type: "number", description: "New left-edge position in feet." },
+          y: { type: "number", description: "New front-edge position in feet." },
+        },
+        required: ["roomId", "x", "y"],
+        additionalProperties: false,
+      },
+      execute: (input) => runtime.perform({
+        type: "move_room",
+        roomId: requiredString(input, "roomId"),
+        x: requiredNumber(input, "x"),
+        y: requiredNumber(input, "y"),
+      }).result,
+    },
+    {
+      name: "resize_room",
+      category: "edit",
+      description:
+        "Resize a room to exact dimensions in feet. Optional anchor holds that corner fixed; defaults to north-west.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          roomId,
+          width: { type: "number", minimum: 3 },
+          length: { type: "number", minimum: 3 },
+          anchor: { type: "string", enum: ["north-west", "north-east", "south-west", "south-east"] },
+        },
+        required: ["roomId", "width", "length"],
+        additionalProperties: false,
+      },
+      execute: (input) => runtime.perform({
+        type: "resize_room",
+        roomId: requiredString(input, "roomId"),
+        width: requiredNumber(input, "width"),
+        length: requiredNumber(input, "length"),
+        anchor: optionalString(input, "anchor") as "north-west" | "north-east" | "south-west" | "south-east" | undefined,
+      }).result,
+    },
+    {
+      name: "adjust_shared_boundary",
+      category: "edit",
+      description: "Adjust the complete shared edge of two aligned rectangular rooms atomically. Both rooms retain at least 3 ft; opening hosts, exterior features, and wall finishes are preserved or the entire edit is rejected.",
+      inputSchema: { type: "object", properties: { roomId, neighborRoomId: { type: "string" }, position: { type: "number", description: "New shared edge x or y position in feet, inferred from adjacency." } }, required: ["roomId", "neighborRoomId", "position"], additionalProperties: false },
+      execute: input => runtime.perform({ type: "adjust_shared_boundary", roomId: requiredString(input, "roomId"), neighborRoomId: requiredString(input, "neighborRoomId"), position: requiredNumber(input, "position") }).result,
+    },
+    {
+      name: "update_room_vertices",
+      category: "edit",
+      description: "Replace a room boundary with 4–12 ordered orthogonal vertices. Use this for precise irregular-plan edits; invalid or crossing boundaries are rejected atomically.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          roomId,
+          vertices: { type: "array", minItems: 4, maxItems: 12, items: { type: "object", properties: { x: { type: "number" }, y: { type: "number" } }, required: ["x", "y"], additionalProperties: false } },
+        },
+        required: ["roomId", "vertices"],
+        additionalProperties: false,
+      },
+      execute: (input) => {
+        if (!Array.isArray(input.vertices)) throw new Error("vertices must be an array.");
+        const vertices = input.vertices.map((item) => {
+          if (!item || typeof item !== "object") throw new Error("Each vertex requires x and y coordinates.");
+          const point = item as Record<string, unknown>;
+          return { x: requiredNumber(point, "x"), y: requiredNumber(point, "y") };
+        });
+        return runtime.perform({ type: "update_room_vertices", roomId: requiredString(input, "roomId"), vertices }).result;
+      },
+    },
+    {
+      name: "update_room",
+      category: "edit",
+      description: "Rename a room or change its programmatic type. Room type drives plan colour and the habitability checks, so keep it accurate.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          roomId,
+          name: { type: "string", description: "New visible room name." },
+          roomType: { type: "string", enum: ["Living Room", "Kitchen", "Bedroom", "Bathroom", "Garage", "Office", "Dining Room", "Storage", "Courtyard", "Custom"] },
+        },
+        required: ["roomId"],
+        additionalProperties: false,
+      },
+      execute: (input) => runtime.perform({
+        type: "update_room",
+        roomId: requiredString(input, "roomId"),
+        name: optionalString(input, "name"),
+        roomType: optionalString(input, "roomType") as RoomType | undefined,
+      }).result,
+    },
+    {
+      name: "delete_room",
+      category: "edit",
+      description:
+        "Delete one room and its derived boundary walls and openings. The transaction is recorded and can be undone in the editor.",
+      inputSchema: {
+        type: "object",
+        properties: { roomId },
+        required: ["roomId"],
+        additionalProperties: false,
+      },
+      execute: (input) => runtime.perform({
+        type: "delete_room",
+        roomId: requiredString(input, "roomId"),
+      }).result,
+    },
+    {
+      name: "add_wall",
+      category: "edit",
+      description:
+        "Add one straight independent wall segment using start and end coordinates in feet.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          floorId,
+          x1: { type: "number" }, y1: { type: "number" },
+          x2: { type: "number" }, y2: { type: "number" },
+          thickness: { type: "number", minimum: 0.2, maximum: 2, default: 0.5 },
+        },
+        required: ["floorId", "x1", "y1", "x2", "y2"],
+        additionalProperties: false,
+      },
+      execute: (input) => runtime.perform({
+        type: "add_wall",
+        floorId: requiredString(input, "floorId"),
+        x1: requiredNumber(input, "x1"), y1: requiredNumber(input, "y1"),
+        x2: requiredNumber(input, "x2"), y2: requiredNumber(input, "y2"),
+        thickness: optionalNumber(input, "thickness"),
+      }).result,
+    },
+    {
+      name: "update_wall",
+      category: "edit",
+      description: "Edit independent-wall endpoints, length from the start, or thickness. Rejects invalid geometry and retains hosted openings atomically. Room-boundary geometry belongs to its rooms.",
+      inputSchema: { type: "object", properties: { wallId, x1: { type: "number" }, y1: { type: "number" }, x2: { type: "number" }, y2: { type: "number" }, length: { type: "number", minimum: 1 }, thickness: { type: "number", minimum: 0.2, maximum: 2 } }, required: ["wallId"], additionalProperties: false },
+      execute: input => runtime.perform({ type: "update_wall", wallId: requiredString(input, "wallId"), x1: optionalNumber(input, "x1"), y1: optionalNumber(input, "y1"), x2: optionalNumber(input, "x2"), y2: optionalNumber(input, "y2"), length: optionalNumber(input, "length"), thickness: optionalNumber(input, "thickness") }).result,
+    },
+    {
+      name: "create_room_from_walls",
+      category: "edit",
+      description: "Convert a simple closed orthogonal enclosure of 4–12 independent walls into a room and slab, preserving wall IDs, thickness, finishes, and valid openings atomically. Branched networks and overlaps are rejected.",
+      inputSchema: { type: "object", properties: { wallId, name: { type: "string" }, roomType: { type: "string", enum: [...roomTypes] } }, required: ["wallId", "name", "roomType"], additionalProperties: false },
+      execute: input => runtime.perform({ type: "create_room_from_walls", wallId: requiredString(input, "wallId"), name: requiredString(input, "name"), roomType: requiredString(input, "roomType") as RoomType }).result,
+    },
+    {
+      name: "split_room_with_wall",
+      category: "edit",
+      description: "Explicitly split a rectangular room using a full-span horizontal or vertical independent partition. Creates two spaces and one shared wall while retaining valid openings and finishes; both sides need at least 3 ft.",
+      inputSchema: { type: "object", properties: { wallId, roomId, name: { type: "string" }, roomType: { type: "string", enum: roomTypes }, firstName: { type: "string" }, firstRoomType: { type: "string", enum: roomTypes } }, required: ["wallId", "roomId"], additionalProperties: false },
+      execute: input => runtime.perform({ type: "split_room_with_wall", wallId: requiredString(input, "wallId"), roomId: requiredString(input, "roomId"), name: optionalString(input, "name"), roomType: optionalString(input, "roomType") as RoomType | undefined, firstName: optionalString(input, "firstName"), firstRoomType: optionalString(input, "firstRoomType") as RoomType | undefined }).result,
+    },
+    {
+      name: "move_wall",
+      category: "edit",
+      description:
+        "Move an independent wall by a horizontal and vertical delta in feet. Room-controlled walls must be changed by moving or resizing their room.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          wallId,
+          dx: { type: "number", default: 0 },
+          dy: { type: "number", default: 0 },
+        },
+        required: ["wallId", "dx", "dy"],
+        additionalProperties: false,
+      },
+      execute: (input) => runtime.perform({
+        type: "move_wall",
+        wallId: requiredString(input, "wallId"),
+        dx: requiredNumber(input, "dx"),
+        dy: requiredNumber(input, "dy"),
+      }).result,
+    },
+    {
+      name: "delete_wall",
+      category: "edit",
+      description: "Delete an independent wall and any openings it hosts. Canonical room-boundary walls cannot be deleted directly; change the room instead.",
+      inputSchema: { type: "object", properties: { wallId }, required: ["wallId"], additionalProperties: false },
+      execute: (input) => {
+        const id = requiredString(input, "wallId");
+        const wall = runtime.getProject().walls.find((item) => item.id === id);
+        if (!wall) throw new Error(`Wall ${id} does not exist.`);
+        return runtime.perform({ type: "delete_element", elementId: id }).result;
+      },
+    },
+    {
+      name: "add_door",
+      category: "edit",
+      description:
+        "Place a configured door on a canonical wall. Offset is the door center's distance in feet from the wall start point; the same handing, swing, and state drive 2D and 3D.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          wallId,
+          offset: { type: "number" },
+          width: { type: "number", minimum: 2, maximum: 8, default: 3 },
+          height: { type: "number", minimum: 6, maximum: 9, default: 7 },
+          hingeSide: { type: "string", enum: ["start", "end"], default: "start" },
+          handing: { type: "string", enum: ["left", "right"], default: "left" },
+          swingDirection: { type: "string", enum: ["inward", "outward"], default: "inward" },
+          opensIntoRoomId: { type: ["string", "null"], description: "Adjacent room the open leaf swings into." },
+          state: { type: "string", enum: ["open", "closed"], default: "open" },
+        },
+        required: ["wallId", "offset"],
+        additionalProperties: false,
+      },
+      execute: (input) => runtime.perform({
+        type: "add_opening",
+        kind: "door",
+        wallId: requiredString(input, "wallId"),
+        offset: requiredNumber(input, "offset"),
+        width: optionalNumber(input, "width"),
+        height: optionalNumber(input, "height"),
+        hingeSide: optionalString(input, "hingeSide") as "start" | "end" | undefined,
+        handing: optionalString(input, "handing") as "left" | "right" | undefined,
+        swingDirection: optionalString(input, "swingDirection") as "inward" | "outward" | undefined,
+          opensIntoRoomId: input.opensIntoRoomId === null ? null : optionalString(input, "opensIntoRoomId"),
+        state: optionalString(input, "state") as "open" | "closed" | undefined,
+      }).result,
+    },
+    {
+      name: "add_window",
+      category: "edit",
+      description:
+        "Place a configured window on a canonical wall. Width, height, sill, type, operation, and glazing are shared by the 2D and 3D representations.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          wallId,
+          offset: { type: "number" },
+          width: { type: "number", minimum: 1, maximum: 16, default: 4 },
+          height: { type: "number", minimum: 1, maximum: 8, default: 4 },
+          sillHeight: { type: "number", minimum: 0, maximum: 8, default: 3 },
+          windowType: { type: "string", enum: ["fixed", "casement", "sliding", "awning"], default: "fixed" },
+          operable: { type: "boolean", description: "Derived from type; a fixed window cannot be operable." },
+          clearWidth: { type: ["number", "null"], exclusiveMinimum: 0, description: "Known unobstructed opening width when fully open, in feet. Omit if unknown; null clears an existing value." },
+          clearHeight: { type: ["number", "null"], exclusiveMinimum: 0, description: "Known unobstructed opening height when fully open, in feet. Omit if unknown; null clears an existing value." },
+          glazing: { type: "string", enum: ["clear", "low-e", "privacy"], default: "clear" },
+          solarHeatGainCoefficient: { type: "number", minimum: 0, maximum: 1, description: "Concept SHGC input; verify against a rated product." },
+          visibleTransmittance: { type: "number", minimum: 0, maximum: 1, description: "Concept visible-transmittance input; verify against a rated product." },
+          uFactor: { type: "number", minimum: 0.1, maximum: 2, description: "Concept U-factor in Btu/(h·ft²·°F); verify against a rated product." },
+        },
+        required: ["wallId", "offset"],
+        additionalProperties: false,
+      },
+      execute: (input) => runtime.perform({
+        type: "add_opening",
+        kind: "window",
+        wallId: requiredString(input, "wallId"),
+        offset: requiredNumber(input, "offset"),
+        width: optionalNumber(input, "width"),
+        height: optionalNumber(input, "height"),
+        sillHeight: optionalNumber(input, "sillHeight"),
+        windowType: optionalString(input, "windowType") as "fixed" | "casement" | "sliding" | "awning" | undefined,
+        operable: optionalBoolean(input, "operable"),
+        clearWidth: input.clearWidth === null ? null : optionalNumber(input, "clearWidth"),
+        clearHeight: input.clearHeight === null ? null : optionalNumber(input, "clearHeight"),
+        glazing: optionalString(input, "glazing") as "clear" | "low-e" | "privacy" | undefined,
+        solarHeatGainCoefficient: optionalNumber(input, "solarHeatGainCoefficient"),
+        visibleTransmittance: optionalNumber(input, "visibleTransmittance"),
+        uFactor: optionalNumber(input, "uFactor"),
+      }).result,
+    },
+    {
+      name: "update_opening",
+      category: "edit",
+      description:
+        "Move or resize a door or window using the same opening state consumed by both the 2D plan and exact 3D wall geometry. Omitted properties remain unchanged.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          openingId,
+          offset: { type: "number", description: "Opening center distance from the wall start, in feet." },
+          width: { type: "number", minimum: 1, maximum: 16 },
+          height: { type: "number", minimum: 1, maximum: 9 },
+          sillHeight: { type: "number", minimum: 0, maximum: 10 },
+          hingeSide: { type: "string", enum: ["start", "end"] },
+          handing: { type: "string", enum: ["left", "right"] },
+          swingDirection: { type: "string", enum: ["inward", "outward"] },
+          opensIntoRoomId: { type: ["string", "null"], description: "Adjacent room the open leaf swings into; overrides legacy handing/swing-direction sign. Null restores legacy behavior." },
+          state: { type: "string", enum: ["open", "closed"] },
+          windowType: { type: "string", enum: ["fixed", "casement", "sliding", "awning"] },
+          operable: { type: "boolean", description: "Setting true alone changes a fixed window to casement; false sets type to fixed." },
+          clearWidth: { type: ["number", "null"], exclusiveMinimum: 0, description: "Known unobstructed opening width when fully open, in feet. Omit if unknown; null clears an existing value." },
+          clearHeight: { type: ["number", "null"], exclusiveMinimum: 0, description: "Known unobstructed opening height when fully open, in feet. Omit if unknown; null clears an existing value." },
+          glazing: { type: "string", enum: ["clear", "low-e", "privacy"] },
+          solarHeatGainCoefficient: { type: "number", minimum: 0, maximum: 1 },
+          visibleTransmittance: { type: "number", minimum: 0, maximum: 1 },
+          uFactor: { type: "number", minimum: 0.1, maximum: 2 },
+        },
+        required: ["openingId"],
+        additionalProperties: false,
+      },
+      execute: (input) => runtime.perform({
+        type: "update_opening",
+        openingId: requiredString(input, "openingId"),
+        offset: optionalNumber(input, "offset"),
+        width: optionalNumber(input, "width"),
+        height: optionalNumber(input, "height"),
+        sillHeight: optionalNumber(input, "sillHeight"),
+        hingeSide: optionalString(input, "hingeSide") as "start" | "end" | undefined,
+        handing: optionalString(input, "handing") as "left" | "right" | undefined,
+        swingDirection: optionalString(input, "swingDirection") as "inward" | "outward" | undefined,
+          opensIntoRoomId: input.opensIntoRoomId === null ? null : optionalString(input, "opensIntoRoomId"),
+        state: optionalString(input, "state") as "open" | "closed" | undefined,
+        windowType: optionalString(input, "windowType") as "fixed" | "casement" | "sliding" | "awning" | undefined,
+        operable: optionalBoolean(input, "operable"),
+        clearWidth: input.clearWidth === null ? null : optionalNumber(input, "clearWidth"),
+        clearHeight: input.clearHeight === null ? null : optionalNumber(input, "clearHeight"),
+        glazing: optionalString(input, "glazing") as "clear" | "low-e" | "privacy" | undefined,
+        solarHeatGainCoefficient: optionalNumber(input, "solarHeatGainCoefficient"),
+        visibleTransmittance: optionalNumber(input, "visibleTransmittance"),
+        uFactor: optionalNumber(input, "uFactor"),
+      }).result,
+    },
+    {
+      name: "set_door_properties",
+      category: "edit",
+      description: "Set architectural door width, height, hinge, handing, swing direction, and open/closed state without creating a separate rendering model.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          openingId,
+          width: { type: "number", minimum: 2, maximum: 8 },
+          height: { type: "number", minimum: 6, maximum: 9 },
+          hingeSide: { type: "string", enum: ["start", "end"] },
+          handing: { type: "string", enum: ["left", "right"] },
+          swingDirection: { type: "string", enum: ["inward", "outward"] },
+          opensIntoRoomId: { type: ["string", "null"], description: "Adjacent room the open leaf swings into; overrides legacy handing/swing-direction sign. Null restores legacy behavior." },
+          state: { type: "string", enum: ["open", "closed"] },
+        },
+        required: ["openingId"],
+        additionalProperties: false,
+      },
+      execute: (input) => {
+        const id = requiredString(input, "openingId");
+        const opening = runtime.getProject().openings.find((item) => item.id === id);
+        if (opening?.kind !== "door") throw new Error(`${id} is not a door.`);
+        return runtime.perform({
+          type: "update_opening",
+          openingId: id,
+          width: optionalNumber(input, "width"),
+          height: optionalNumber(input, "height"),
+          hingeSide: optionalString(input, "hingeSide") as "start" | "end" | undefined,
+          handing: optionalString(input, "handing") as "left" | "right" | undefined,
+          swingDirection: optionalString(input, "swingDirection") as "inward" | "outward" | undefined,
+          opensIntoRoomId: input.opensIntoRoomId === null ? null : optionalString(input, "opensIntoRoomId"),
+          state: optionalString(input, "state") as "open" | "closed" | undefined,
+        }).result;
+      },
+    },
+    {
+      name: "rehost_door",
+      category: "edit",
+      description: "Move an existing door onto another compatible canonical wall at an exact center offset.",
+      inputSchema: { type: "object", properties: { openingId, wallId, offset: { type: "number" } }, required: ["openingId", "wallId", "offset"], additionalProperties: false },
+      execute: (input) => {
+        const id = requiredString(input, "openingId");
+        if (runtime.getProject().openings.find((item) => item.id === id)?.kind !== "door") throw new Error(`${id} is not a door.`);
+        return runtime.perform({ type: "rehost_opening", openingId: id, wallId: requiredString(input, "wallId"), offset: requiredNumber(input, "offset") }).result;
+      },
+    },
+    {
+      name: "set_window_properties",
+      category: "edit",
+      description: "Set window size, sill height, type, operability, and concept-stage NFRC-style glazing inputs in the shared architectural model.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          openingId,
+          width: { type: "number", minimum: 1, maximum: 16 },
+          height: { type: "number", minimum: 1, maximum: 8 },
+          sillHeight: { type: "number", minimum: 0, maximum: 8 },
+          windowType: { type: "string", enum: ["fixed", "casement", "sliding", "awning"] },
+          operable: { type: "boolean", description: "Setting true alone changes a fixed window to casement; false sets type to fixed." },
+          clearWidth: { type: ["number", "null"], exclusiveMinimum: 0, description: "Known unobstructed opening width when fully open, in feet. Omit if unknown; null clears an existing value." },
+          clearHeight: { type: ["number", "null"], exclusiveMinimum: 0, description: "Known unobstructed opening height when fully open, in feet. Omit if unknown; null clears an existing value." },
+          glazing: { type: "string", enum: ["clear", "low-e", "privacy"] },
+          solarHeatGainCoefficient: { type: "number", minimum: 0, maximum: 1 },
+          visibleTransmittance: { type: "number", minimum: 0, maximum: 1 },
+          uFactor: { type: "number", minimum: 0.1, maximum: 2 },
+        },
+        required: ["openingId"],
+        additionalProperties: false,
+      },
+      execute: (input) => {
+        const id = requiredString(input, "openingId");
+        const opening = runtime.getProject().openings.find((item) => item.id === id);
+        if (opening?.kind !== "window") throw new Error(`${id} is not a window.`);
+        return runtime.perform({
+          type: "update_opening",
+          openingId: id,
+          width: optionalNumber(input, "width"),
+          height: optionalNumber(input, "height"),
+          sillHeight: optionalNumber(input, "sillHeight"),
+          windowType: optionalString(input, "windowType") as "fixed" | "casement" | "sliding" | "awning" | undefined,
+          operable: optionalBoolean(input, "operable"),
+        clearWidth: input.clearWidth === null ? null : optionalNumber(input, "clearWidth"),
+        clearHeight: input.clearHeight === null ? null : optionalNumber(input, "clearHeight"),
+          glazing: optionalString(input, "glazing") as "clear" | "low-e" | "privacy" | undefined,
+          solarHeatGainCoefficient: optionalNumber(input, "solarHeatGainCoefficient"),
+          visibleTransmittance: optionalNumber(input, "visibleTransmittance"),
+          uFactor: optionalNumber(input, "uFactor"),
+        }).result;
+      },
+    },
+    {
+      name: "rehost_window",
+      category: "edit",
+      description: "Move an existing window onto another compatible canonical wall at an exact center offset.",
+      inputSchema: { type: "object", properties: { openingId, wallId, offset: { type: "number" } }, required: ["openingId", "wallId", "offset"], additionalProperties: false },
+      execute: (input) => {
+        const id = requiredString(input, "openingId");
+        if (runtime.getProject().openings.find((item) => item.id === id)?.kind !== "window") throw new Error(`${id} is not a window.`);
+        return runtime.perform({ type: "rehost_opening", openingId: id, wallId: requiredString(input, "wallId"), offset: requiredNumber(input, "offset") }).result;
+      },
+    },
+    {
+      name: "set_exact_dimension",
+      category: "edit",
+      description: "Set one exact dimension or position on a room, opening, or the plot. The change uses the same operation pipeline as manual inspector input.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          elementId: { type: "string", description: "Room/opening ID, or the literal 'plot'." },
+          property: { type: "string", enum: ["width", "length", "x", "y", "offset", "height", "sillHeight"] },
+          value: { type: "number", description: "Exact value in feet." },
+        },
+        required: ["elementId", "property", "value"],
+        additionalProperties: false,
+      },
+      execute: (input) => {
+        const elementId = requiredString(input, "elementId");
+        const property = requiredString(input, "property");
+        const value = requiredNumber(input, "value");
+        const project = runtime.getProject();
+        if (elementId === "plot") {
+          if (property !== "width" && property !== "length") throw new Error("Plot supports width or length.");
+          return runtime.perform({ type: "set_plot", [property]: value }).result;
+        }
+        const room = project.rooms.find((item) => item.id === elementId);
+        if (room) {
+          if (property === "width" || property === "length") return runtime.perform({ type: "resize_room", roomId: room.id, width: property === "width" ? value : room.width, length: property === "length" ? value : room.length }).result;
+          if (property === "x" || property === "y") return runtime.perform({ type: "move_room", roomId: room.id, x: property === "x" ? value : room.x, y: property === "y" ? value : room.y }).result;
+          throw new Error("Rooms support width, length, x, or y.");
+        }
+        const opening = project.openings.find((item) => item.id === elementId);
+        if (opening && ["width", "offset", "height", "sillHeight"].includes(property)) {
+          return runtime.perform({ type: "update_opening", openingId: opening.id, [property]: value }).result;
+        }
+        throw new Error(`Element ${elementId} does not support ${property}.`);
+      },
+    },
+    {
+      name: "delete_opening",
+      category: "edit",
+      description:
+        "Delete a door or window from the shared plan. Its 2D symbol, real 3D wall cutout, frame or panel, and navigable opening update together.",
+      inputSchema: {
+        type: "object",
+        properties: { openingId },
+        required: ["openingId"],
+        additionalProperties: false,
+      },
+      execute: (input) => {
+        const id = requiredString(input, "openingId");
+        const opening = runtime.getProject().openings.find((item) => item.id === id);
+        if (!opening) throw new Error(`Opening ${id} does not exist.`);
+        return runtime.perform({ type: "delete_element", elementId: id }).result;
+      },
+    },
+    {
+      name: "add_stairs",
+      category: "edit",
+      description: "Add one straight, quarter-turn L-shaped, or half-turn U-shaped stair between adjacent floors. One semantic stair drives plan, 3D, validation, stairwell opening, circulation, and Walk Mode.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          floorId,
+          x: { type: "number" }, y: { type: "number" },
+          stairType: { type: "string", enum: ["straight", "l-shaped", "u-shaped"], default: "straight", description: "Straight uses one flight; l-shaped uses perpendicular flights and a quarter landing; u-shaped uses parallel return flights and a half landing." },
+          width: { type: "number", minimum: 3, description: "Clear width of one stair flight in feet." },
+          length: { type: "number", minimum: 3, description: "Horizontal run of one flight in feet. Straight stairs require at least 6 ft." },
+          upperFlightLength: { type: "number", minimum: 3, description: "Upper-flight run for an L-shaped stair. Omit to match the lower flight." },
+          landingDepth: { type: "number", minimum: 3, description: "Clear quarter- or half-landing depth in feet; it must be at least the clear flight width." },
+          wellWidth: { type: "number", minimum: 0, maximum: 8, default: 0.5, description: "Clear gap between parallel U-shaped flights. Use 0 for a compact dog-leg stair." },
+          turnSide: { type: "string", enum: ["left", "right"], default: "left", description: "Direction of the 90- or 180-degree turn while ascending the lower flight." },
+          direction: { type: "string", enum: ["up", "down"], default: "up" },
+          rotation: { type: "number", enum: [0, 90, 180, 270], default: 0, description: "Quarter-turn plan rotation in degrees." },
+        },
+        required: ["floorId", "x", "y", "width", "length"],
+        additionalProperties: false,
+      },
+      execute: (input) => runtime.perform({
+        type: "add_stairs",
+        floorId: requiredString(input, "floorId"),
+        x: requiredNumber(input, "x"), y: requiredNumber(input, "y"),
+        width: requiredNumber(input, "width"), length: requiredNumber(input, "length"),
+        upperFlightLength: optionalNumber(input, "upperFlightLength"),
+        direction: input.direction as "up" | "down" | undefined,
+        rotation: optionalNumber(input, "rotation") as StairRotation | undefined,
+        stairType: optionalString(input, "stairType") as StairType | undefined,
+        landingDepth: optionalNumber(input, "landingDepth"),
+        wellWidth: optionalNumber(input, "wellWidth"),
+        turnSide: optionalString(input, "turnSide") as StairTurnSide | undefined,
+      }).result,
+    },
+    {
+      name: "update_stairs",
+      category: "edit",
+      description: "Move, resize, rotate, reverse, or convert a stair between straight, quarter-turn L-shaped, and half-turn U-shaped configurations while retaining its stable identity.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          stairId: { type: "string", description: "Stable staircase ID." },
+          x: { type: "number" }, y: { type: "number" },
+          stairType: { type: "string", enum: ["straight", "l-shaped", "u-shaped"] },
+          width: { type: "number", minimum: 3, description: "Clear width of one flight." },
+          length: { type: "number", minimum: 3, description: "Horizontal run of one flight; straight stairs require at least 6 ft." },
+          upperFlightLength: { type: "number", minimum: 3, description: "Upper-flight run for an L-shaped stair." },
+          landingDepth: { type: "number", minimum: 3 },
+          wellWidth: { type: "number", minimum: 0, maximum: 8 },
+          turnSide: { type: "string", enum: ["left", "right"] },
+          direction: { type: "string", enum: ["up", "down"] },
+          rotation: { type: "number", enum: [0, 90, 180, 270], description: "Plan rotation in 90-degree increments." },
+        },
+        required: ["stairId"],
+        additionalProperties: false,
+      },
+      execute: (input) => runtime.perform({
+        type: "update_stairs",
+        stairId: requiredString(input, "stairId"),
+        x: optionalNumber(input, "x"), y: optionalNumber(input, "y"),
+        width: optionalNumber(input, "width"), length: optionalNumber(input, "length"),
+        upperFlightLength: optionalNumber(input, "upperFlightLength"),
+        direction: optionalString(input, "direction") as "up" | "down" | undefined,
+        rotation: optionalNumber(input, "rotation") as StairRotation | undefined,
+        stairType: optionalString(input, "stairType") as StairType | undefined,
+        landingDepth: optionalNumber(input, "landingDepth"),
+        wellWidth: optionalNumber(input, "wellWidth"),
+        turnSide: optionalString(input, "turnSide") as StairTurnSide | undefined,
+      }).result,
+    },
+    {
+      name: "delete_stairs",
+      category: "edit",
+      description: "Delete a staircase. Its plan symbol, 3D flights, stairwell void, circulation edge, and Walk Mode route are removed together.",
+      inputSchema: { type: "object", properties: { stairId: { type: "string", description: "Stable stair identifier returned by inspect_floor or add_stairs." } }, required: ["stairId"], additionalProperties: false },
+      execute: (input) => {
+        const id = requiredString(input, "stairId");
+        if (!runtime.getProject().stairs.some((item) => item.id === id)) throw new Error(`Stair ${id} does not exist.`);
+        return runtime.perform({ type: "delete_element", elementId: id }).result;
+      },
+    },
+    {
+      name: "set_exterior_finish",
+      category: "edit",
+      description: "Set one lightweight, project-wide exterior facade finish. This changes 3D exterior wall appearance without adding heavy assembly simulation.",
+      inputSchema: { type: "object", properties: { finish: { type: "string", enum: ["stucco", "brick", "concrete", "timber", "metal"] } }, required: ["finish"], additionalProperties: false },
+      execute: (input) => runtime.perform({ type: "set_exterior_finish", finish: requiredString(input, "finish") as ExteriorFinishId }).result,
+    },
+    {
+      name: "set_wall_finish",
+      category: "edit",
+      description: "Set or reset an exterior or independent wall finish. Independent-wall overrides apply to both sides; omit finish to inherit the project palette.",
+      inputSchema: { type: "object", properties: { wallId, finish: { type: "string", enum: ["stucco", "brick", "concrete", "timber", "metal"] } }, required: ["wallId"], additionalProperties: false },
+      execute: (input) => runtime.perform({ type: "set_wall_finish", wallId: requiredString(input, "wallId"), finish: optionalString(input, "finish") as ExteriorFinishId | undefined }).result,
+    },
+    {
+      name: "set_roof",
+      category: "edit",
+      description: "Configure the lightweight flat roof parapet and its visual finish. Omitted values remain unchanged.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          parapetEnabled: { type: "boolean" }, parapetHeight: { type: "number", minimum: 0.5, maximum: 6 },
+          parapetThickness: { type: "number", minimum: 0.2, maximum: 2 },
+          finish: { type: "string", enum: ["stucco", "brick", "concrete", "timber", "metal"] },
+        },
+        additionalProperties: false,
+      },
+      execute: (input) => runtime.perform({ type: "set_roof", parapetEnabled: optionalBoolean(input, "parapetEnabled"), parapetHeight: optionalNumber(input, "parapetHeight"), parapetThickness: optionalNumber(input, "parapetThickness"), finish: optionalString(input, "finish") as ExteriorFinishId | undefined }).result,
+    },
+    {
+      name: "configure_site_boundary",
+      category: "edit",
+      description: "Configure the plot boundary wall and adjustable front gate, including height, size, position, style, and lightweight finish.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          enabled: { type: "boolean" }, height: { type: "number", minimum: 2, maximum: 10 }, thickness: { type: "number", minimum: 0.2, maximum: 2 },
+          finish: { type: "string", enum: ["stucco", "brick", "concrete", "timber", "metal"] }, gateEnabled: { type: "boolean" },
+          gateOffset: { type: "number", minimum: 0 }, gateWidth: { type: "number", minimum: 3 }, gateHeight: { type: "number", minimum: 3, maximum: 10 },
+          gateStyle: { type: "string", enum: ["slatted", "solid"] },
+        },
+        additionalProperties: false,
+      },
+      execute: (input) => runtime.perform({ type: "set_site_boundary", enabled: optionalBoolean(input, "enabled"), height: optionalNumber(input, "height"), thickness: optionalNumber(input, "thickness"), finish: optionalString(input, "finish") as ExteriorFinishId | undefined, gateEnabled: optionalBoolean(input, "gateEnabled"), gateOffset: optionalNumber(input, "gateOffset"), gateWidth: optionalNumber(input, "gateWidth"), gateHeight: optionalNumber(input, "gateHeight"), gateStyle: optionalString(input, "gateStyle") as "slatted" | "solid" | undefined }).result,
+    },
+    {
+      name: "add_balcony",
+      category: "edit",
+      description: "Add a rectangular balcony or terrace slab with a bounded lightweight railing system on a floor.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          floorId, name: { type: "string" }, kind: { type: "string", enum: ["balcony", "terrace"], default: "balcony" },
+          x: { type: "number" }, y: { type: "number" }, width: { type: "number", minimum: 3 }, length: { type: "number", minimum: 3 },
+          slabThickness: { type: "number", minimum: 0.25, maximum: 2 }, finish: { type: "string", enum: ["stucco", "brick", "concrete", "timber", "metal"] },
+          railingEnabled: { type: "boolean" }, railingHeight: { type: "number", minimum: 2, maximum: 6 }, railingStyle: { type: "string", enum: ["horizontal", "vertical", "solid"] },
+          railingSides: { type: "array", items: { type: "string", enum: ["north", "east", "south", "west"] }, minItems: 1, maxItems: 4 },
+        },
+        required: ["floorId", "x", "y", "width", "length"], additionalProperties: false,
+      },
+      execute: (input) => runtime.perform({ type: "add_balcony", floorId: requiredString(input, "floorId"), name: optionalString(input, "name"), kind: optionalString(input, "kind") as "balcony" | "terrace" | undefined, x: requiredNumber(input, "x"), y: requiredNumber(input, "y"), width: requiredNumber(input, "width"), length: requiredNumber(input, "length"), slabThickness: optionalNumber(input, "slabThickness"), finish: optionalString(input, "finish") as ExteriorFinishId | undefined, railingEnabled: optionalBoolean(input, "railingEnabled"), railingHeight: optionalNumber(input, "railingHeight"), railingStyle: optionalString(input, "railingStyle") as RailingStyle | undefined, railingSides: optionalStringArray(input, "railingSides") as WallSide[] | undefined }).result,
+    },
+    {
+      name: "update_balcony",
+      category: "edit",
+      description: "Update balcony or terrace geometry, type, finish, and railing without replacing its stable project identity.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          balconyId: { type: "string" }, name: { type: "string" }, kind: { type: "string", enum: ["balcony", "terrace"] },
+          x: { type: "number" }, y: { type: "number" }, width: { type: "number", minimum: 3 }, length: { type: "number", minimum: 3 },
+          slabThickness: { type: "number", minimum: 0.25, maximum: 2 }, finish: { type: "string", enum: ["stucco", "brick", "concrete", "timber", "metal"] },
+          railingEnabled: { type: "boolean" }, railingHeight: { type: "number", minimum: 2, maximum: 6 }, railingStyle: { type: "string", enum: ["horizontal", "vertical", "solid"] },
+          railingSides: { type: "array", items: { type: "string", enum: ["north", "east", "south", "west"] }, minItems: 1, maxItems: 4 },
+        },
+        required: ["balconyId"], additionalProperties: false,
+      },
+      execute: (input) => runtime.perform({ type: "update_balcony", balconyId: requiredString(input, "balconyId"), name: optionalString(input, "name"), kind: optionalString(input, "kind") as "balcony" | "terrace" | undefined, x: optionalNumber(input, "x"), y: optionalNumber(input, "y"), width: optionalNumber(input, "width"), length: optionalNumber(input, "length"), slabThickness: optionalNumber(input, "slabThickness"), finish: optionalString(input, "finish") as ExteriorFinishId | undefined, railingEnabled: optionalBoolean(input, "railingEnabled"), railingHeight: optionalNumber(input, "railingHeight"), railingStyle: optionalString(input, "railingStyle") as RailingStyle | undefined, railingSides: optionalStringArray(input, "railingSides") as WallSide[] | undefined }).result,
+    },
+    {
+      name: "delete_balcony",
+      category: "edit",
+      description: "Delete one balcony or terrace and its derived slab and railing representations.",
+      inputSchema: { type: "object", properties: { balconyId: { type: "string" } }, required: ["balconyId"], additionalProperties: false },
+      execute: (input) => runtime.perform({ type: "delete_balcony", balconyId: requiredString(input, "balconyId") }).result,
+    },
+    {
+      name: "add_facade_feature",
+      category: "edit",
+      description: "Add a frame, canopy, or sunshade hosted by an exterior wall with exact lightweight geometry.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          kind: { type: "string", enum: ["frame", "canopy", "sunshade"] }, wallId, offset: { type: "number" }, width: { type: "number", minimum: 1 },
+          elevation: { type: "number", minimum: 0 }, height: { type: "number", minimum: 0.1 }, projection: { type: "number", minimum: 0.1, maximum: 8 },
+          thickness: { type: "number", minimum: 0.1, maximum: 2 }, finish: { type: "string", enum: ["stucco", "brick", "concrete", "timber", "metal"] },
+        },
+        required: ["kind", "wallId", "offset", "width"], additionalProperties: false,
+      },
+      execute: (input) => runtime.perform({ type: "add_facade_feature", kind: requiredString(input, "kind") as FacadeFeatureKind, wallId: requiredString(input, "wallId"), offset: requiredNumber(input, "offset"), width: requiredNumber(input, "width"), elevation: optionalNumber(input, "elevation"), height: optionalNumber(input, "height"), projection: optionalNumber(input, "projection"), thickness: optionalNumber(input, "thickness"), finish: optionalString(input, "finish") as ExteriorFinishId | undefined }).result,
+    },
+    {
+      name: "update_facade_feature",
+      category: "edit",
+      description: "Update or rehost a frame, canopy, or sunshade while retaining its stable project identity.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          featureId: { type: "string" }, kind: { type: "string", enum: ["frame", "canopy", "sunshade"] }, wallId,
+          offset: { type: "number" }, width: { type: "number", minimum: 1 }, elevation: { type: "number", minimum: 0 }, height: { type: "number", minimum: 0.1 },
+          projection: { type: "number", minimum: 0.1, maximum: 8 }, thickness: { type: "number", minimum: 0.1, maximum: 2 }, finish: { type: "string", enum: ["stucco", "brick", "concrete", "timber", "metal"] },
+        },
+        required: ["featureId"], additionalProperties: false,
+      },
+      execute: (input) => runtime.perform({ type: "update_facade_feature", featureId: requiredString(input, "featureId"), kind: optionalString(input, "kind") as FacadeFeatureKind | undefined, wallId: optionalString(input, "wallId"), offset: optionalNumber(input, "offset"), width: optionalNumber(input, "width"), elevation: optionalNumber(input, "elevation"), height: optionalNumber(input, "height"), projection: optionalNumber(input, "projection"), thickness: optionalNumber(input, "thickness"), finish: optionalString(input, "finish") as ExteriorFinishId | undefined }).result,
+    },
+    {
+      name: "delete_facade_feature",
+      category: "edit",
+      description: "Delete one hosted façade frame, canopy, or sunshade from the shared model.",
+      inputSchema: { type: "object", properties: { featureId: { type: "string" } }, required: ["featureId"], additionalProperties: false },
+      execute: (input) => runtime.perform({ type: "delete_facade_feature", featureId: requiredString(input, "featureId") }).result,
+    },
+    {
+      name: "create_floor",
+      category: "edit",
+      description:
+        "Create the next building storey and make it active. Use only after the ground-floor layout is established.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          name: { type: "string" },
+          height: { type: "number", minimum: 7, maximum: 16, default: 9 },
+        },
+        additionalProperties: false,
+      },
+      execute: (input) => runtime.perform({
+        type: "create_floor",
+        name: typeof input.name === "string" ? input.name : undefined,
+        height: optionalNumber(input, "height"),
+      }).result,
+    },
+    {
+      name: "set_floor_height",
+      category: "edit",
+      description: "Change one storey's floor-to-floor height. Every storey above is re-levelled and each connected stair's rise, riser count, and tread depth are recomputed from the new elevations.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          floorId,
+          height: { type: "number", minimum: 7, maximum: 16, description: "Floor-to-floor height in feet." },
+        },
+        required: ["floorId", "height"],
+        additionalProperties: false,
+      },
+      execute: (input) => runtime.perform({
+        type: "set_floor_height",
+        floorId: requiredString(input, "floorId"),
+        height: requiredNumber(input, "height"),
+      }).result,
+    },
+    {
+      name: "calculate_room_area",
+      category: "calculate",
+      description: "Calculate the exact polygon area and bounding dimensions of one room from the live project model.",
+      inputSchema: { type: "object", properties: { roomId }, required: ["roomId"], additionalProperties: false },
+      annotations: readOnly,
+      execute: (input) => {
+        const room = runtime.getProject().rooms.find((item) => item.id === requiredString(input, "roomId"));
+        if (!room) throw new Error("Room does not exist.");
+        return { roomId: room.id, name: room.name, shape: room.shape ?? "rectangle", vertices: room.vertices, width: room.width, length: room.length, netRoomArea: roomArea(room), carpetArea: roomCarpetArea(runtime.getProject(), room), area: roomArea(room), areaDefinition: "netRoomArea is measured to wall centrelines; carpetArea estimates usable area from average wall thickness, without finishes, independent partitions, or stair-void deductions. The area alias is retained for compatibility.", unit: "sq ft" };
+      },
+    },
+    {
+      name: "calculate_total_area",
+      category: "calculate",
+      description:
+        "Return explicitly named net and gross architectural areas for the active floor and whole building, with definitions that avoid ambiguous coverage values.",
+      inputSchema: emptyObject,
+      annotations: readOnly,
+      execute: () => {
+        const metrics = projectMetrics(runtime.getProject());
+        return {
+          totalNetFloorArea: metrics.totalNetFloorArea,
+          totalNetBuildingArea: metrics.totalNetBuildingArea,
+          grossCoveredArea: metrics.grossCoveredArea,
+          totalGrossCoveredArea: metrics.totalGrossCoveredArea,
+          plotArea: metrics.plotArea,
+          definitions: metrics.measurementDefinitions,
+          compatibility: {
+            floorCoveredArea: metrics.floorCoveredArea,
+            totalConstructedArea: metrics.totalConstructedArea,
+            note: "Legacy union-of-room-footprints values retained for existing clients; prefer the explicitly named net/gross fields.",
+          },
+          unit: metrics.unit,
+        };
+      },
+    },
+    {
+      name: "calculate_open_area",
+      category: "calculate",
+      description: "Calculate open site area outside the gross ground-floor building footprint and the gross site coverage percentage.",
+      inputSchema: emptyObject,
+      annotations: readOnly,
+      execute: () => {
+        const metrics = projectMetrics(runtime.getProject());
+        return { plotArea: metrics.plotArea, openSiteArea: metrics.openSiteArea, grossCoveragePercent: metrics.coveragePercent, definition: metrics.measurementDefinitions.openSiteArea, unit: metrics.unit };
+      },
+    },
+    {
+      name: "measure_distance",
+      category: "calculate",
+      description:
+        "Measure exact straight, horizontal, and vertical distances between two coordinates or element centers/endpoints.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          from: {
+            type: "object",
+            description: "Either {x,y} or {elementId, anchor}. All coordinates are feet.",
+            properties: { x: { type: "number" }, y: { type: "number" }, elementId: { type: "string" }, anchor: { type: "string", enum: ["center", "start", "end"] } },
+            additionalProperties: false,
+          },
+          to: {
+            type: "object",
+            description: "Either {x,y} or {elementId, anchor}. All coordinates are feet.",
+            properties: { x: { type: "number" }, y: { type: "number" }, elementId: { type: "string" }, anchor: { type: "string", enum: ["center", "start", "end"] } },
+            additionalProperties: false,
+          },
+        },
+        required: ["from", "to"],
+        additionalProperties: false,
+      },
+      annotations: readOnly,
+      execute: (input) => measureDistance(runtime.getProject(), pointReference(input.from, "from"), pointReference(input.to, "to")),
+    },
+    {
+      name: "validate_layout",
+      category: "calculate",
+      description:
+        "Analyze geometry, canonical openings, exterior access, main-entrance reachability, disconnected room groups, and stair connections. Returns structured, correctable findings—not final code certification.",
+      inputSchema: {
+        type: "object",
+        properties: { floorId: { ...floorId, description: "Optional floor to validate; omit to validate the entire project." } },
+        additionalProperties: false,
+      },
+      execute: (input) => {
+        const report: ValidationReport = validateLayout(runtime.getProject(), typeof input.floorId === "string" ? input.floorId : undefined);
+        runtime.noteActivity(`Agent validated the layout · ${report.issueCount} ${report.issueCount === 1 ? "issue" : "issues"}`, "validate_layout");
+        return report;
+      },
+    },
+    {
+      name: "switch_view",
+      category: "present",
+      description: "Visibly switch the shared ArchMorph canvas between 2D floor-plan and 3D building modes.",
+      inputSchema: {
+        type: "object",
+        properties: { mode: { type: "string", enum: ["2d", "3d"] } },
+        required: ["mode"],
+        additionalProperties: false,
+      },
+      execute: (input) => runtime.perform({ type: "switch_view", mode: requiredString(input, "mode") as "2d" | "3d" }).result,
+    },
+    {
+      name: "set_active_floor",
+      category: "present",
+      description: "Make one storey the active floor. The plan, inspector, 3D level presentation, and Walk Mode all follow it, so call this before inspecting or editing another floor visually.",
+      inputSchema: { type: "object", properties: { floorId }, required: ["floorId"], additionalProperties: false },
+      execute: (input) => runtime.perform({ type: "set_active_floor", floorId: requiredString(input, "floorId") }).result,
+    },
+    {
+      name: "set_camera",
+      category: "present",
+      description: "Switch to 3D and visibly move the camera to a standard architectural view.",
+      inputSchema: {
+        type: "object",
+        properties: { scope: { type: "string", enum: ["project", "floor", "selection"], default: "project" }, preset: { type: "string", enum: ["front", "rear", "left", "right", "top", "front-left", "front-right"] } },
+        required: ["preset"],
+        additionalProperties: false,
+      },
+      execute: (input) => runtime.perform({ type: "set_camera", preset: requiredString(input, "preset") as CameraPreset, scope: optionalString(input, "scope") as "project" | "floor" | "selection" | undefined }).result,
+    },
+    {
+      name: "set_navigation_mode",
+      category: "present",
+      description:
+        "Switch the live 3D canvas between exterior orbit controls and first-person walkthrough controls. Optionally enter a specific room by stable ID.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          mode: { type: "string", enum: ["orbit", "walk"] },
+          roomId: { type: "string", description: "Optional room, balcony, or terrace ID to start inside when entering Walk." },
+        },
+        required: ["mode"],
+        additionalProperties: false,
+      },
+      execute: (input) => runtime.perform({
+        type: "set_navigation_mode",
+        mode: requiredString(input, "mode") as "orbit" | "walk",
+        roomId: typeof input.roomId === "string" ? input.roomId : undefined,
+      }).result,
+    },
+    {
+      name: "focus_element",
+      category: "present",
+      description: "Visibly focus the current 2D or 3D view on a room, wall, door, window, or stair by stable ID. Omit the ID to fit the whole project.",
+      inputSchema: {
+        type: "object",
+        properties: { elementId: { type: "string" } },
+        additionalProperties: false,
+      },
+      execute: (input) => runtime.perform({ type: "focus_element", elementId: typeof input.elementId === "string" ? input.elementId : undefined }).result,
+    },
+    {
+      name: "take_snapshot",
+      category: "present",
+      description:
+        "Capture the current live 2D plan or 3D canvas after any requested view and camera changes. Returns image metadata and a PNG data URL.",
+      inputSchema: {
+        type: "object",
+        properties: { download: { type: "boolean", default: false, description: "Also download the PNG in the human's browser." } },
+        additionalProperties: false,
+      },
+      execute: (input, options) => runtime.captureSnapshot({
+        download: input.download === true,
+        signal: options?.signal,
+      }),
+    },
+    {
+      name: "export_plan",
+      category: "present",
+      description:
+        "Export the current shared design as structured ArchMorph JSON or a clean SVG floor plan. The export identifies the exact project version.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          format: { type: "string", enum: ["json", "svg"], default: "json" },
+          download: { type: "boolean", default: false },
+        },
+        additionalProperties: false,
+      },
+      execute: (input, options) => runtime.exportPlan(
+        input.format === "svg" ? "svg" : "json",
+        input.download === true,
+        options?.signal,
+      ),
+    },
+  ];
+  const editable = tools.filter(t => t.category === "edit").map(t => t.name);
+  const batchSchema = { type: "object", properties: { expectedVersion: { type: "number" }, changes: { type: "array", minItems: 1, maxItems: 50, items: { type: "object", properties: { tool: { type: "string", enum: editable }, input: { type: "object", additionalProperties: true } }, required: ["tool", "input"], additionalProperties: false } } }, required: ["expectedVersion", "changes"], additionalProperties: false };
+  const prepareBatch = (input: Record<string, unknown>) => {
+    const before = runtime.getProject();
+    if (input.expectedVersion !== before.version) throw new Error("The design changed. Inspect its current version before preparing a batch.");
+    let draft = cloneProject(before);
+    const operations: ArchitectureOperation[] = [], outputs: unknown[] = [], createdElementIds: string[][] = [];
+    const ids = (p: Project) => [p.floors,p.rooms,p.walls,p.openings,p.stairs,p.balconies,p.facadeFeatures].flatMap(items => items.map(item => item.id));
+    const sandbox = createArchMorphTools({ ...runtime, getProject: () => draft, perform: op => { const beforeIds = new Set(ids(draft)); const outcome = applyOperation(draft, op, "agent"); draft = outcome.project; operations.push(op); createdElementIds.push(ids(draft).filter(id => !beforeIds.has(id))); return outcome; }, noteActivity: () => {} });
+    const resolve = (value: unknown): unknown => {
+      if (typeof value === "string" && /^\$\d+\./.test(value)) {
+        const [step, ...keys] = value.slice(1).split(".");
+        let result = outputs[Number(step) - 1];
+        for (const key of keys) result = result && typeof result === "object" ? (result as Record<string, unknown>)[key] : undefined;
+        if (result === undefined) throw new Error(`Unknown prior-step reference ${value}.`);
+        return result;
+      }
+      if (Array.isArray(value)) return value.map(resolve);
+      if (value && typeof value === "object") return Object.fromEntries(Object.entries(value).map(([key,item]) => [key,resolve(item)]));
+      return value;
+    };
+    for (const [index, change] of (input.changes as { tool: string; input: Record<string, unknown> }[]).entries()) {
+      if (!editable.includes(change.tool)) throw new Error(`Batch step ${index + 1} must be a design edit.`);
+      try { outputs.push(sandbox.find(t => t.name === change.tool)!.execute(resolve(change.input) as Record<string, unknown>)); }
+      catch (error) { throw new Error(`Batch step ${index + 1} failed: ${error instanceof Error ? error.message : String(error)}`); }
+    }
+    return { before, draft, operations, outputs, createdElementIds };
+  };
+  tools.push({
+    name: "propose_room_layout", category: "inspect", annotations: readOnly,
+    description: "Find validated draft positions or dimensions. Rebalance shrinks roomId by areaPercent and expands neighborRoomId. Alternatives are partial changes and need a separate user decision.",
+    inputSchema: { type: "object", properties: {
+      roomId, neighborRoomId: { type: "string" },
+      goal: { type: "string", enum: ["move", "shrink", "grow", "rebalance"] },
+      areaPercent: { type: "number", minimum: 1, maximum: 90 },
+    }, required: ["roomId", "goal"], additionalProperties: false },
+    execute: input => {
+      const project = runtime.getProject();
+      return proposeRoomLayout(project, {
+        roomId: requiredString(input, "roomId"),
+        neighborRoomId: optionalString(input, "neighborRoomId"),
+        goal: requiredString(input, "goal"),
+        areaPercent: typeof input.areaPercent === "number" ? input.areaPercent : 20,
+      }, changes => prepareBatch({ expectedVersion: project.version, changes }));
+    },
+  });
+  tools.push({
+    name: "propose_floor_rooms", category: "inspect", annotations: readOnly,
+    description: "Read-only. Plans rooms for an upper floor as one tested batch: on an EMPTY floor it stacks a stair, adds an Upper Landing and rooms; on a floor with rooms it fills free space over the floor below, each room with a door to a connected room. Single create_room/add_stairs on upper floors are often rejected; apply this batch after the user approves.",
+    inputSchema: { type: "object", properties: {
+      floorId: { type: "string", description: "The upper floor's ID from create_floor or inspect_project." },
+      rooms: { type: "array", maxItems: 8, items: { type: "object", properties: { name: { type: "string" }, roomType: { type: "string", enum: ["Living Room", "Kitchen", "Bedroom", "Bathroom", "Garage", "Office", "Dining Room", "Storage", "Courtyard", "Custom"] } }, required: ["name", "roomType"], additionalProperties: false } },
+      roomCount: { type: "number", minimum: 1, maximum: 8, description: "Used when rooms is omitted: default names and types are chosen." },
+      fill: { type: "boolean", description: "When rooms is omitted on a floor that already has rooms, fill every free spot." },
+    }, required: ["floorId"], additionalProperties: false },
+    execute: input => {
+      const project = runtime.getProject();
+      return proposeFloorRooms(project, {
+        floorId: requiredString(input, "floorId"),
+        rooms: Array.isArray(input.rooms) ? input.rooms as { name: string; roomType: string }[] : undefined,
+        roomCount: typeof input.roomCount === "number" ? input.roomCount : undefined,
+        fill: input.fill === true,
+      }, changes => prepareBatch({ expectedVersion: project.version, changes }));
+    },
+  });
+  tools.push({
+    name: "inspect_floor_space", category: "inspect", annotations: readOnly,
+    description: "Read-only. How much free area an upper floor still has over the floor below: used area, free area, free area by side (left/right/top/bottom in plan view) and each free spot with its size and the lower room it sits over. Use when the user asks how much space is left, or where rooms still fit.",
+    inputSchema: { type: "object", properties: { floorId: { type: "string" } }, required: ["floorId"], additionalProperties: false },
+    execute: input => floorFreeSpace(runtime.getProject(), requiredString(input, "floorId")),
+  });
+  tools.push({ name: "preview_changes", category: "inspect", annotations: readOnly, description: "Preview 1–50 design tool calls without changing the live project. Supply expectedVersion. Later inputs may refer to earlier outputs, e.g. $1.room.id. Returns metrics and checks before applying.", inputSchema: batchSchema, execute: input => { const batch = prepareBatch(input); return { baseVersion: batch.before.version, changeCount: batch.operations.length, results: batch.outputs, metrics: projectMetrics(batch.draft), validation: validateLayout(batch.draft) }; } });
+  tools.push({ name: "apply_changes", category: "edit", description: "Apply a previously reviewed batch of 1–50 design tool calls atomically as one version and one Undo step. Supply expectedVersion; any failing step rejects every change. Supports prior-step references such as $1.room.id.", inputSchema: batchSchema, execute: input => { const batch = prepareBatch(input); assertNoNewDesignIssues(batch.before, batch.draft); return runtime.perform({ type: "apply_batch", expectedVersion: batch.before.version, operations: batch.operations, createdElementIds: batch.createdElementIds }).result; } });
+  return tools.map(tool => ({ ...tool, execute: (input, options) => { if (tool.name !== "take_snapshot") options?.signal?.throwIfAborted(); assertToolInput(input, tool.inputSchema); return tool.execute(input, options); } }));
+}

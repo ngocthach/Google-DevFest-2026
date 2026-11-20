@@ -143,7 +143,7 @@ assert.equal(tools.length, STUDIO_TOOL_COUNT, "the studio tool count must match 
 assert.equal(new Set(names).size, tools.length, "WebMCP tool names must be unique");
 assert.deepEqual(
   Object.fromEntries(["inspect", "edit", "calculate", "present"].map((category) => [category, tools.filter((tool) => tool.category === category).length])),
-  { inspect: 10, edit: 42, calculate: 5, present: 7 },
+  { inspect: 12, edit: 42, calculate: 5, present: 7 },
   "the documented category counts must match the live catalog",
 );
 
@@ -157,6 +157,8 @@ for (const tool of tools) {
 const expectedReadOnly = new Set([
   "preview_changes",
   "propose_room_layout",
+  "propose_floor_rooms",
+  "inspect_floor_space",
   "inspect_project",
   "inspect_plot",
   "inspect_floor",

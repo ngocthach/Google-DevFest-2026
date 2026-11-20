@@ -4,12 +4,14 @@ import { readFileSync } from "node:fs";
 import { createInterface } from "node:readline";
 import { applyOperation, migrateProject, roomArea } from "../src/lib/architecture.ts";
 import { createArchMorphTools } from "../src/lib/webmcp-tools.ts";
+import { assertNoNewDesignIssues } from "../src/lib/agent-room-layout.ts";
 
 const fixture = migrateProject(JSON.parse(readFileSync(new URL("../public/demo-fixtures/sukoon-studio-demo.archmorph.json", import.meta.url), "utf8")).project);
 let project = fixture;
 const tools = createArchMorphTools({
   getProject: () => project,
-  perform: operation => { const outcome = applyOperation(project, operation, "agent"); project = outcome.project; return outcome; },
+  // Mirror Studio.tsx: every agent edit is rejected if it introduces new layout errors.
+  perform: operation => { const outcome = applyOperation(project, operation, "agent"); assertNoNewDesignIssues(project, outcome.project); project = outcome.project; return outcome; },
   captureSnapshot: async () => ({}),
   exportPlan: () => ({}),
   noteActivity: () => {},

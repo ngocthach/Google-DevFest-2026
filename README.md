@@ -5,7 +5,7 @@ This repo contains two live demos. In each one, a Gemini agent built with Google
 | Demo | Folder | What it shows | URL |
 |---|---|---|---|
 | **RoomLab** | [`demo/`](demo/) | A small room planner with 7 tools. The agent creates, resizes and moves rooms, and places and moves furniture. | http://127.0.0.1:8766/ |
-| **ArchMorph** | [`ArchMorph/`](ArchMorph/) | A full architecture studio with 64 tools. The agent previews layout changes and applies them after your approval. | http://127.0.0.1:3001/studio |
+| **ArchMorph** | [`ArchMorph/`](ArchMorph/) | A full architecture studio with 66 tools. The agent previews layout changes and applies them after your approval. | http://127.0.0.1:3001/studio |
 
 The data flow is the same for both demos:
 
@@ -119,15 +119,33 @@ Other useful checks:
 
 The pending preview lives in the ArchMorph bridge's memory. It survives switching between chat and voice, stopping and restarting voice, and reloading the tab. It is **lost when the bridge (port 8767) restarts**.
 
+### 5c. Add a new floor with rooms
+
+1. Click **Load Studio demo**.
+2. In chat or voice, say: *“Thêm một tầng mới cho tôi, phòng tầng mới tùy bạn đặt tên và thêm số phòng.”*
+   - Expected log: `create_floor`, then `propose_floor_rooms`, then a line like *“Xem trước tầng mới · Upper Landing 224 ft² · Master Bedroom 224 ft² · Bedroom 2 160 ft² · cầu thang từ First Floor · 0 lỗi”*.
+   - The new Second Floor is empty at this point. The rooms are only a proposal.
+3. Say **“Cứ làm đi.”**
+   - Expected: one `apply_changes` batch adds the U-shaped stair from First Floor, the Upper Landing, the rooms and a door from the landing to each room.
+   - All of it saves as one version and one Undo step. The rooms appear on Second Floor.
+
+4. Say: *“Phòng chơi game, phòng bếp, phòng karaoke, diện tích tùy phần còn lại, fill dần cho đầy tầng.”*
+   - Expected: `propose_floor_rooms` with `fill: true`, then a line like *“Xem trước thêm phòng · Game Room 196 ft² · Kitchen 84 ft² · Karaoke Room 224 ft² · Upper Hall 96 ft² · Study 144 ft² · Family Lounge 96 ft² · còn trống 0 ft² · 0 lỗi”*.
+   - The planner sizes each room from the free space over the floor below. Each room gets a door to a room that is already connected. When a narrow strip is the only way to reach the remaining space, it becomes an **Upper Hall**. The agent should not ask you for sizes.
+5. Say **“Cứ làm đi.”** Expected: one batch, 0 layout errors, and the floor is full (1,448 ft²).
+6. Ask: *“Phần bên phải của nhà còn trống bao nhiêu?”* Expected: `inspect_floor_space` and a log line *“Diện tích trống Second Floor: … ft² · top … · right …”*. The agent answers with those numbers.
+
+Why a batch: on an empty upper floor, a single `create_room` is rejected (`DISCONNECTED_CIRCULATION`, because no stair reaches it). A single `add_stairs` is rejected too (`INVALID_STAIR_CONNECTION`, because the stair has no room to land in). Rejected edits now show in the assistant log as **✗ … bị từ chối: …**.
+
 ## 6. Automated tests (no Gemini key or Chrome needed)
 
 ### ArchMorph
 
 ```bash
 cd ArchMorph
-npm run test:pending        # pending preview: chat→voice approval, stale re-preview, Garden Study
+npm run test:pending        # pending preview: chat→voice approval, stale re-preview, Garden Study, new floor, fill a floor
 npm run test:architecture
-npm run test:webmcp         # 64 studio tools register and execute
+npm run test:webmcp         # 66 studio tools register and execute
 npm run test:demo           # Creative Studio room + door + window, 0 issues
 npm run test:model
 npm run test:studio

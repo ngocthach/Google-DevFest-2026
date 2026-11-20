@@ -10,7 +10,8 @@ import copy
 import json
 import time
 
-PREVIEW_TOOLS = {'propose_room_layout', 'preview_changes'}
+PROPOSAL_TOOLS = {'propose_room_layout', 'propose_floor_rooms'}
+PREVIEW_TOOLS = PROPOSAL_TOOLS | {'preview_changes'}
 
 
 def normalize_result(result):
@@ -69,7 +70,7 @@ class PendingPreviewStore:
         project = await self._project(request_browser)
         if not project:
             return None
-        if tool == 'propose_room_layout':
+        if tool in PROPOSAL_TOOLS:
             options, alternatives = payload.get('options') or [], payload.get('alternatives') or []
             chosen = options[0] if options else alternatives[0] if alternatives else None
             if not chosen or not chosen.get('changes'):
@@ -83,7 +84,8 @@ class PendingPreviewStore:
             kind, rooms = 'batch', []
         if version != project['version']:
             return None  # The preview is already stale; do not store something unappliable.
-        summary = ', '.join(f"{r['name']}: {r['beforeArea']} → {r['afterArea']} feet vuông" for r in rooms) \
+        summary = ', '.join((f"{r['name']} mới {r['afterArea']} feet vuông" if not r.get('beforeArea') else
+                             f"{r['name']}: {r['beforeArea']} → {r['afterArea']} feet vuông") for r in rooms) \
             or f"{len(changes)} thay đổi: " + ', '.join(c.get('tool', '?') for c in changes)
         self.plan = {'kind': kind, 'tool': tool, 'args': copy.deepcopy(args), 'projectId': project.get('id'),
                      'projectName': project.get('name'), 'expectedVersion': version,
@@ -107,8 +109,11 @@ class PendingPreviewStore:
                 return await self._repreview(request_browser, plan, project['version'])
             result = normalize_result(await request_browser(
                 'apply_changes', {'expectedVersion': plan['expectedVersion'], 'changes': plan['changes']}))
-            if is_error(result):
-                return {'status': 'error', 'error': result.get('error') if isinstance(result, dict) else str(result),
+            after = await self._project(request_browser)
+            if is_error(result) or not after or after['version'] == plan['expectedVersion']:
+                # Never report success unless the drawing version actually advanced.
+                error = result.get('error') if isinstance(result, dict) else str(result)
+                return {'status': 'error', 'error': error or 'The drawing did not change; nothing was saved.',
                         'pending': self.public()}
             self.clear()
             return {'status': 'applied', 'appliedPlan': plan['summaryVi'], 'kind': plan['kind'],
@@ -116,7 +121,7 @@ class PendingPreviewStore:
 
     async def _repreview(self, request_browser, plan, current_version):
         old_summary = plan['summaryVi']
-        if plan['tool'] == 'propose_room_layout':
+        if plan['tool'] in PROPOSAL_TOOLS:
             args = plan['args']
         else:
             args = {**plan['args'], 'expectedVersion': current_version}
