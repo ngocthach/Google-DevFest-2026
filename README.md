@@ -134,6 +134,10 @@ The pending preview lives in the ArchMorph bridge's memory. It survives switchin
    - The planner sizes each room from the free space over the floor below. Each room gets a door to a room that is already connected. When a narrow strip is the only way to reach the remaining space, it becomes an **Upper Hall**. The agent should not ask you for sizes.
 5. Say **“Cứ làm đi.”** Expected: one batch, 0 layout errors, and the floor is full (1,448 ft²).
 6. Ask: *“Phần bên phải của nhà còn trống bao nhiêu?”* Expected: `inspect_floor_space` and a log line *“Diện tích trống Second Floor: … ft² · top … · right …”*. The agent answers with those numbers.
+7. Grow rooms instead of adding them: *“Mở rộng phòng Hobby và Guest Bedroom ra phía sau cho đầy.”*
+   - Expected: `propose_floor_rooms` with `expandRooms: true` and `expandOnly: ["Hobby Room","Guest Bedroom"]`. The plan uses only `resize_room` steps, for example Guest Bedroom 144 → 240 ft².
+
+Free space is measured against the real footprint of the floor below, including custom-shaped rooms such as *Evening Family Lounge*.
 
 Why a batch: on an empty upper floor, a single `create_room` is rejected (`DISCONNECTED_CIRCULATION`, because no stair reaches it). A single `add_stairs` is rejected too (`INVALID_STAIR_CONNECTION`, because the stair has no room to land in). Rejected edits now show in the assistant log as **✗ … bị từ chối: …**.
 

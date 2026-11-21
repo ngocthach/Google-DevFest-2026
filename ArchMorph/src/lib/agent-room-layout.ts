@@ -1,4 +1,4 @@
-import { roomArea, roomContainsPoint, sharedRoomBoundary, stairEntryPoint, validateLayout, type Project, type Room } from "./architecture.ts";
+import { roomArea, roomContainsPoint, roomVertices, sharedRoomBoundary, stairEntryPoint, validateLayout, type Project, type Room } from "./architecture.ts";
 
 export type DesignChange = { tool: string; input: Record<string, unknown> };
 
@@ -134,7 +134,7 @@ const DEFAULT_UPPER_ROOMS: RequestedRoom[] = [
  */
 export function proposeFloorRooms(
   project: Project,
-  input: { floorId: string; rooms?: RequestedRoom[]; roomCount?: number; fill?: boolean },
+  input: { floorId: string; rooms?: RequestedRoom[]; roomCount?: number; fill?: boolean; expandRooms?: boolean; expandOnly?: string[] },
   preview: (changes: DesignChange[]) => DraftPreview,
 ) {
   const floors = [...project.floors].sort((a, b) => a.level - b.level);
@@ -228,9 +228,6 @@ export function proposeFloorRooms(
 
 type Rect = { x: number; y: number; width: number; length: number };
 const r2 = (value: number) => Math.round(value * 100) / 100;
-const overlapArea = (a: Rect, b: Rect) =>
-  Math.max(0, Math.min(a.x + a.width, b.x + b.width) - Math.max(a.x, b.x)) *
-  Math.max(0, Math.min(a.y + a.length, b.y + b.length) - Math.max(a.y, b.y));
 // Two rectangles touch along an edge long enough for a 3 ft door.
 const touches = (a: Rect, b: Rect) => {
   const near = (p: number, q: number) => Math.abs(p - q) < 0.05;
@@ -240,8 +237,9 @@ const touches = (a: Rect, b: Rect) => {
 };
 
 /**
- * Free space on an upper floor: lower-floor rooms that no room on this floor covers yet. Each spot can hold a room
- * fully inside the footprint below. Sides are plan-view (x grows to the right, y grows downward on screen).
+ * Free space on an upper floor, measured against the real footprint below (custom-shaped rooms included):
+ * lower-floor room area that no room on this floor covers yet, cut into rectangles per lower room.
+ * Sides are plan-view (x grows to the right, y grows downward on screen).
  */
 export function floorFreeSpace(project: Project, floorId: string) {
   const floors = [...project.floors].sort((a, b) => a.level - b.level);
@@ -251,28 +249,57 @@ export function floorFreeSpace(project: Project, floorId: string) {
   const used = project.rooms.filter(room => room.floorId === target.id);
   const usedArea = r2(used.reduce((sum, room) => sum + roomArea(room), 0));
   if (!below) return { floor: { id: target.id, name: target.name }, areaUnit: "square feet", usedArea, freeSpots: [], note: "Ground floor: free space is limited by the site, not a floor below." };
-  const lower = project.rooms.filter(room => room.floorId === below.id && room.type !== "Courtyard" && (room.shape ?? "rectangle") === "rectangle" && !room.vertices);
+  const lower = project.rooms.filter(room => room.floorId === below.id && room.type !== "Courtyard");
   const footprintArea = r2(lower.reduce((sum, room) => sum + roomArea(room), 0));
-  const minX = Math.min(...lower.map(room => room.x)), maxX = Math.max(...lower.map(room => room.x + room.width));
-  const minY = Math.min(...lower.map(room => room.y)), maxY = Math.max(...lower.map(room => room.y + room.length));
-  const box = { minX, maxX, minY, maxY };
-  const freeSpots = lower
-    .filter(room => used.every(upper => overlapArea(room, upper) < 0.5))
-    .map(room => {
-      const rect = { x: room.x, y: room.y, width: room.width, length: room.length };
+  const points = lower.flatMap(roomVertices);
+  const box = { minX: Math.min(...points.map(p => p.x)), maxX: Math.max(...points.map(p => p.x)),
+    minY: Math.min(...points.map(p => p.y)), maxY: Math.max(...points.map(p => p.y)) };
+  // Compressed grid on every room edge of both floors, so each cell is wholly inside or outside every room.
+  const lines = (axis: "x" | "y") => [...new Set([...lower, ...used].flatMap(roomVertices).map(p => r2(p[axis])))].sort((a, b) => a - b);
+  const xs = lines("x"), ys = lines("y");
+  const owner: (number | -1)[][] = ys.slice(0, -1).map((_, j) => xs.slice(0, -1).map((_, i) => {
+    const centre = { x: (xs[i] + xs[i + 1]) / 2, y: (ys[j] + ys[j + 1]) / 2 };
+    if (used.some(room => roomContainsPoint(room, centre))) return -1;
+    return lower.findIndex(room => roomContainsPoint(room, centre));
+  }));
+  const freeSpots: (Rect & { area: number; above: string; side: string; sideVi: string; touchesUpperRooms: string[] })[] = [];
+  let freeArea = 0;
+  lower.forEach((room, index) => {
+    // Largest all-free rectangle of this lower room's cells, repeatedly, until its free cells are used up.
+    const cells = owner.flatMap((row, j) => row.flatMap((value, i) => value === index ? [[i, j]] : []));
+    if (!cells.length) return;
+    freeArea += cells.reduce((sum, [i, j]) => sum + (xs[i + 1] - xs[i]) * (ys[j + 1] - ys[j]), 0);
+    const i0 = Math.min(...cells.map(c => c[0])), i1 = Math.max(...cells.map(c => c[0]));
+    const j0 = Math.min(...cells.map(c => c[1])), j1 = Math.max(...cells.map(c => c[1]));
+    const taken = new Set<string>();
+    const free = (i: number, j: number) => owner[j][i] === index && !taken.has(`${i},${j}`);
+    for (;;) {
+      let best: { a: number; b: number; c: number; d: number; area: number } | undefined;
+      for (let a = i0; a <= i1; a++) for (let c = j0; c <= j1; c++) {
+        if (!free(a, c)) continue;
+        let maxB = i1;
+        for (let d = c; d <= j1 && free(a, d); d++) {
+          for (let b = a; b <= maxB; b++) if (!free(b, d)) { maxB = b - 1; break; }
+          const area = (xs[maxB + 1] - xs[a]) * (ys[d + 1] - ys[c]);
+          if (!best || area > best.area) best = { a, b: maxB, c, d, area };
+        }
+      }
+      if (!best || best.area < 1) break;
+      for (let i = best.a; i <= best.b; i++) for (let j = best.c; j <= best.d; j++) taken.add(`${i},${j}`);
+      const rect = { x: xs[best.a], y: ys[best.c], width: r2(xs[best.b + 1] - xs[best.a]), length: r2(ys[best.d + 1] - ys[best.c]) };
       const { key, vi } = sideOf(rect, box);
-      return { ...rect, area: r2(roomArea(room)), above: room.name, side: key, sideVi: vi,
-        touchesUpperRooms: used.filter(upper => touches(rect, upper)).map(upper => upper.name) };
-    })
-    .sort((a, b) => b.area - a.area);
-  const freeArea = r2(freeSpots.reduce((sum, spot) => sum + spot.area, 0));
+      freeSpots.push({ ...rect, area: r2(best.area), above: room.name, side: key, sideVi: vi,
+        touchesUpperRooms: used.filter(upper => touches(rect, upper)).map(upper => upper.name) });
+    }
+  });
+  freeSpots.sort((a, b) => b.area - a.area);
   const bySide = freeSpots.reduce<Record<string, number>>((acc, spot) => {
     for (const part of spot.side.split("-")) acc[part] = r2((acc[part] ?? 0) + spot.area);
     return acc;
   }, {});
   return { floor: { id: target.id, name: target.name }, floorBelow: { id: below.id, name: below.name }, areaUnit: "square feet", spokenAreaUnitVi: "feet vuông",
-    footprintBelowArea: footprintArea, footprintBox: box, usedArea, freeArea, freeAreaBySide: bySide, freeSpots,
-    note: "Free spots are lower-floor rooms not yet covered on this floor. Use propose_floor_rooms to fill them." };
+    footprintBelowArea: footprintArea, footprintBox: box, usedArea, freeArea: r2(freeArea), freeAreaBySide: bySide, freeSpots,
+    note: "Free spots are parts of lower-floor rooms not yet covered on this floor. Use propose_floor_rooms to add rooms there (fill=true), or expandRooms=true to grow adjacent rooms into them." };
 }
 
 // Merge free spots that together form one rectangle (e.g. two 7×6 rooms below → one 14×6 spot).
@@ -302,7 +329,7 @@ function extendFloorRooms(
   project: Project,
   target: { id: string; name: string },
   below: { id: string; name: string },
-  input: { rooms?: RequestedRoom[]; roomCount?: number; fill?: boolean },
+  input: { rooms?: RequestedRoom[]; roomCount?: number; fill?: boolean; expandRooms?: boolean; expandOnly?: string[] },
   preview: (changes: DesignChange[]) => DraftPreview,
 ) {
   const base = { baseVersion: project.version, areaUnit: "square feet", spokenAreaUnitVi: "feet vuông", alternatives: [] as unknown[] };
@@ -311,13 +338,16 @@ function extendFloorRooms(
   const spots = merged.filter(spot => Math.min(spot.width, spot.length) >= 5).sort((a, b) => b.width * b.length - a.width * a.length);
   // Strips 3.5–5 ft wide are too narrow for a room but can become a hall that reaches spots further away.
   const strips = merged.filter(spot => Math.min(spot.width, spot.length) >= 3.5 && Math.min(spot.width, spot.length) < 5);
-  if (!spots.length) return { ...base, status: "no_complete_plan", options: [], space, blockers: [`${target.name} has no free space left over the floor below that is at least 5 ft wide.`] };
+  const scraps = merged.filter(spot => Math.min(spot.width, spot.length) < 3.5);
+  const expand = Boolean(input.fill || input.expandRooms);
+  if (!merged.length) return { ...base, status: "no_complete_plan", options: [], space, blockers: [`${target.name} has no free space left over the floor below.`] };
   const existing = new Set(project.rooms.map(room => room.name.toLowerCase()));
   const defaults = [...DEFAULT_UPPER_ROOMS, { name: "Family Room", roomType: "Living Room" }, { name: "Guest Bedroom", roomType: "Bedroom" },
     { name: "Hobby Room", roomType: "Custom" }, { name: "Storage", roomType: "Storage" }]
     .filter(room => !existing.has(room.name.toLowerCase()) && !input.rooms?.some(asked => asked.name.toLowerCase() === room.name.toLowerCase()));
   const asked = (input.rooms ?? []).map(room => ({ name: room.name.trim(), roomType: room.roomType }));
-  const extra = input.fill ? spots.length : asked.length ? 0 : Math.max(1, Math.round(input.roomCount ?? 2));
+  // expandRooms means "grow what is there": only rooms the user named are added.
+  const extra = input.expandRooms ? 0 : input.fill ? spots.length : asked.length ? 0 : Math.max(1, Math.round(input.roomCount ?? 2));
   const requested = [...asked, ...defaults.slice(0, Math.max(0, extra - asked.length))].slice(0, 8);
   const sideAt = (rect: Rect) => "footprintBox" in space && space.footprintBox ? sideOf(rect, space.footprintBox).vi : "";
   const baseline = validateLayout(project);
@@ -330,6 +360,8 @@ function extendFloorRooms(
   const skipped: string[] = [];
   let lastReport: ReturnType<typeof validateLayout> | undefined;
 
+  // New rooms by batch reference (step n -> "$n.room.id"), so the expansion pass can grow them too.
+  const created: [string, { name: string } & Rect][] = [];
   const place = (room: RequestedRoom, pool: Rect[]) => {
     for (const spot of pool.filter(candidate => connected.some(item => touches(candidate, item.rect)))) {
       const create: DesignChange = { tool: "create_room", input: { floorId: target.id, name: room.name, roomType: room.roomType, ...spot } };
@@ -351,6 +383,7 @@ function extendFloorRooms(
             const report = validateLayout(draft);
             const findings = newDesignIssues(baseline, report);
             if (findings.length) { findings.forEach(issue => blocked.add(`${issue.code}: ${issue.message}`)); continue; }
+            created.push([`$${accepted.length + 1}.room.id`, { name: room.name, ...spot }]);
             connected.push({ rect: spot, ref: room.name, step: accepted.length, name: room.name });
             accepted.push(create, door);
             pool.splice(pool.indexOf(spot), 1);
@@ -371,11 +404,70 @@ function extendFloorRooms(
     pending = pending.filter(room => !place(room, free));
   }
   skipped.push(...pending.map(room => room.name));
-  if (!placed.length || !lastReport) return { ...base, status: "no_complete_plan", options: [], space,
-    blockers: blocked.size ? [...blocked].slice(0, 8) : [`No free spot on ${target.name} touches a connected room, so a new room could not get a door.`] };
+
+  // Grow existing rectangular rooms into adjacent leftovers when the result stays a rectangle (fill or expandRooms).
+  const grown = new Map<string, { name: string; beforeArea: number; afterArea: number; side: string }>();
+  if (expand) {
+    const only = new Set((input.expandOnly ?? []).map(name => name.trim().toLowerCase()));
+    const dims = new Map(project.rooms
+      .filter(room => room.floorId === target.id && (room.shape ?? "rectangle") === "rectangle" && !room.vertices &&
+        (!only.size || only.has(room.name.toLowerCase()) || only.has(room.id.toLowerCase())))
+      .map(room => [room.id, { name: room.name, x: room.x, y: room.y, width: room.width, length: room.length }] as [string, { name: string } & Rect])
+      .concat(created.filter(([, room]) => !only.size || only.has(room.name.toLowerCase()))));
+    const pool: Rect[] = [...free, ...strips, ...scraps];
+    const near = (p: number, q: number) => Math.abs(p - q) < 0.05;
+    const covers = (from: number, to: number, start: number, end: number) => from <= start + 0.05 && to >= end - 0.05;
+    for (let progress = true; progress;) {
+      progress = false;
+      pool.sort((a, b) => b.width * b.length - a.width * a.length);
+      search: for (const leftover of pool) for (const [roomId, room] of dims) {
+        const L = leftover, R = room;
+        let piece: Rect | undefined, next: Rect | undefined, anchor = "north-west";
+        if (covers(L.x, L.x + L.width, R.x, R.x + R.width) && near(L.y, R.y + R.length)) {
+          piece = { x: R.x, y: L.y, width: R.width, length: L.length }; next = { ...R, length: R.length + L.length };
+        } else if (covers(L.x, L.x + L.width, R.x, R.x + R.width) && near(L.y + L.length, R.y)) {
+          piece = { x: R.x, y: L.y, width: R.width, length: L.length }; next = { ...R, y: L.y, length: R.length + L.length }; anchor = "south-west";
+        } else if (covers(L.y, L.y + L.length, R.y, R.y + R.length) && near(L.x, R.x + R.width)) {
+          piece = { x: L.x, y: R.y, width: L.width, length: R.length }; next = { ...R, width: R.width + L.width };
+        } else if (covers(L.y, L.y + L.length, R.y, R.y + R.length) && near(L.x + L.width, R.x)) {
+          piece = { x: L.x, y: R.y, width: L.width, length: R.length }; next = { ...R, x: L.x, width: R.width + L.width }; anchor = "north-east";
+        }
+        if (!piece || !next) continue;
+        const resize: DesignChange = { tool: "resize_room", input: { roomId, width: r2(next.width), length: r2(next.length), anchor } };
+        try {
+          const { draft } = preview([...accepted, resize]);
+          const report = validateLayout(draft);
+          if (newDesignIssues(baseline, report).length) continue;
+          accepted.push(resize);
+          lastReport = report;
+          const before = grown.get(roomId)?.beforeArea ?? r2(R.width * R.length);
+          dims.set(roomId, { ...R, ...next });
+          grown.set(roomId, { name: R.name, beforeArea: before, afterArea: r2(next.width * next.length), side: sideAt(next) });
+          // Return what is left of the leftover after cutting out the absorbed piece.
+          pool.splice(pool.indexOf(leftover), 1);
+          const rest: Rect[] = piece.width === L.width
+            ? [{ ...L, x: L.x, y: L.y, length: piece.y - L.y }, { ...L, y: piece.y + piece.length, length: L.y + L.length - piece.y - piece.length }]
+            : [{ ...L, width: piece.x - L.x }, { ...L, x: piece.x + piece.width, width: L.x + L.width - piece.x - piece.width }];
+          pool.push(...rest.filter(part => part.width > 0.05 && part.length > 0.05).map(part => ({ ...part, width: r2(part.width), length: r2(part.length) })));
+          progress = true;
+          break search;
+        } catch (error) { blocked.add(error instanceof Error ? error.message : String(error)); }
+      }
+    }
+    free.splice(0, free.length, ...pool);
+  }
+
+  for (const [ref, room] of grown) {
+    const made = created.find(([key]) => key === ref);
+    const fresh = made && placed.find(item => item.name === made[1].name);
+    if (fresh) { fresh.afterArea = room.afterArea; grown.delete(ref); }
+  }
+  const affectedRooms = [...placed, ...[...grown.values()].map(room => ({ ...room, expanded: true }))];
+  if (!affectedRooms.length || !lastReport) return { ...base, status: "no_complete_plan", options: [], space,
+    blockers: blocked.size ? [...blocked].slice(0, 8) : [`No free spot on ${target.name} touches a connected room, so a new room could not get a door, and no room could grow into it as a rectangle.`] };
   const remaining = free.map(spot => ({ ...spot, area: r2(spot.width * spot.length), side: sideAt(spot) }));
   return { ...base, status: "preview_ready", mode: "extend", floor: { id: target.id, name: target.name }, options: [{
-    expectedVersion: project.version, changes: accepted, affectedRooms: placed, newRooms: true, stair: null,
+    expectedVersion: project.version, changes: accepted, affectedRooms, newRooms: placed.length > 0, stair: null,
     skippedRooms: skipped, errors: lastReport.errors, warnings: lastReport.warnings,
   }], freeAreaBefore: space.freeArea, freeAreaAfter: r2(remaining.reduce((sum, spot) => sum + spot.area, 0)), remainingFreeSpots: remaining,
   blockers: skipped.length ? [`Could not place ${skipped.join(", ")}: no remaining free spot connects to ${target.name}'s rooms.`] : [] };

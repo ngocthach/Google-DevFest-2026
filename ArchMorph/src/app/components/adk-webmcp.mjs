@@ -39,7 +39,7 @@ export async function executeArchMorphRequest(name, args, log) {
   }
   if (name === 'propose_floor_rooms') {
     const option = payload?.options?.[0];
-    const rooms = option?.affectedRooms.map(room => `${room.name} ${room.afterArea} ft²`).join(' · ');
+    const rooms = option?.affectedRooms.map(room => room.beforeArea ? `${room.name} ${room.beforeArea} → ${room.afterArea} ft²` : `${room.name} ${room.afterArea} ft²`).join(' · ');
     if (option?.stair) log(`Xem trước tầng mới · ${rooms} · cầu thang từ ${option.stair.from} · ${option.errors} lỗi`);
     else if (option) log(`Xem trước thêm phòng · ${rooms} · còn trống ${payload.freeAreaAfter} ft² · ${option.errors} lỗi`);
     else if (payload?.blockers?.length) log(`Không có phương án tầng mới: ${payload.blockers[0]}`);

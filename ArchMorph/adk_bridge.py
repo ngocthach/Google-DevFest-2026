@@ -152,13 +152,17 @@ async def chat(ws: WebSocket):
             return {'status': 'error', 'error': 'Supply a native Studio tool name and a JSON object.'}
         result = await request_browser(name, args)
         return with_floor_hint(result) if name in ('create_room','add_stairs') else result
-    async def propose_floor_rooms(floorId: str, roomNames: str = '', roomCount: int = 2, fill: bool = False) -> dict:
-        """Plan rooms for an upper floor as one tested batch. Works on an EMPTY upper floor (stacked stair, Upper Landing, rooms, doors) and on a floor that already has rooms (fills free space over the floor below, a door to a connected room each, adding an Upper Hall when needed). Read-only. roomNames is optional and comma-separated, e.g. "Game Room, Kitchen, Karaoke Room"; otherwise roomCount default rooms are chosen. fill=true also fills every remaining free spot ("lấp đầy tầng"). Sizes come from the free space; never ask the user for sizes. Present the result, then on approval call apply_pending_preview."""
+    async def propose_floor_rooms(floorId: str, roomNames: str = '', roomCount: int = 2, fill: bool = False,
+                                  expandRooms: bool = False, expandRoomNames: str = '') -> dict:
+        """Plan rooms for an upper floor as one tested batch. Read-only. Works on an EMPTY upper floor (stacked stair, Upper Landing, rooms, doors) and on a floor that already has rooms (new rooms over free space below, a door to a connected room each, an Upper Hall when needed). roomNames: optional, comma-separated, e.g. "Game Room, Kitchen". fill=true fills every free spot ("lấp đầy tầng", "thêm cho đầy") and grows rooms into leftovers. expandRooms=true grows existing rooms into adjacent free space instead of adding rooms ("mở rộng phòng ... cho đầy"); expandRoomNames limits which rooms grow, comma-separated. Sizes come from the free space; never ask the user for sizes. Present the result, then on approval call apply_pending_preview."""
         args = {'floorId': floorId}
         names = [n.strip() for n in roomNames.split(',') if n.strip()][:8]
         if names: args['rooms'] = [{'name': n, 'roomType': guess_room_type(n)} for n in names]
-        else: args['roomCount'] = max(1, min(8, int(roomCount or 2)))
+        elif not expandRooms: args['roomCount'] = max(1, min(8, int(roomCount or 2)))
         if fill: args['fill'] = True
+        if expandRooms: args['expandRooms'] = True
+        grow = [n.strip() for n in expandRoomNames.split(',') if n.strip()][:8]
+        if grow: args['expandOnly'] = grow
         return await request_browser('propose_floor_rooms', args)
     async def inspect_floor_space(floorId: str) -> dict:
         """Read-only. Free area left on an upper floor over the floor below: used, free, free by side (left/right/top/bottom in plan view) and each free spot. Use for "còn trống bao nhiêu", "bên phải còn bao nhiêu diện tích"."""
@@ -181,6 +185,12 @@ async def chat(ws: WebSocket):
         'MORE ROOMS ON AN UPPER FLOOR: when the user wants to add rooms to, or fill, an upper floor that already has rooms, '
         'call propose_floor_rooms with that floor ID, roomNames from the request and fill=true if they want the floor full. '
         'Do not ask for sizes or room types: the planner sizes rooms from the free space. '
+        'TRUST THE USER ABOUT FREE SPACE: if the user says part of a floor is still empty, call inspect_floor_space again and '
+        'then propose_floor_rooms (fill=true, or expandRooms=true with expandRoomNames when they ask to enlarge rooms). '
+        'Never answer "the floor is full" without a fresh tool result in this turn. If inspect_floor_space shows 0 but the user '
+        'insists, say what the tool measured (free area over the floor below) and offer propose_room_layout to grow a named room. '
+        'When propose_room_layout or propose_floor_rooms returns options with 0 errors, present that plan and ask for approval; '
+        'never say it is impossible. Warnings do not block a plan. '
         'When the user asks how much space is free (on a side or overall), call inspect_floor_space and answer with its numbers. '
         'Never build upper-floor rooms with single create_room or add_stairs calls: they are rejected as disconnected or overhanging. '
         'Report the proposed rooms with their sizes (and the stair, if any) and what stays free, ask for approval, then call apply_pending_preview. '

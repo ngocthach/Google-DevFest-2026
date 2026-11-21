@@ -117,6 +117,24 @@ async def main():
     after = normalize_result(await browser('inspect_floor_space', {'floorId': floor}))
     assert after['freeArea'] < space['freeArea'], (space['freeArea'], after['freeArea'])
     print(f"PASS extend floor applied: free area {space['freeArea']} -> {after['freeArea']} ft², 0 layout errors")
+    assert after['freeArea'] == 0, after['freeSpots']  # free space includes custom-shaped rooms below (Evening Family Lounge)
+
+    # 7. Grow existing rooms into the space behind them instead of adding rooms (expandRooms).
+    await browser('__reset__', {})
+    floor = normalize_result(await browser('create_floor', {'height': 9}))['floor']['id']
+    first = normalize_result(await browser('propose_floor_rooms', {'floorId': floor, 'roomCount': 2}))['options'][0]
+    await browser('apply_changes', {'expectedVersion': first['expectedVersion'], 'changes': first['changes']})
+    space = normalize_result(await browser('inspect_floor_space', {'floorId': floor}))
+    args = {'floorId': floor, 'expandRooms': True}
+    plan = await store.capture(browser, 'propose_floor_rooms', args, await browser('propose_floor_rooms', args))
+    assert plan and all(r.get('beforeArea') for r in plan['rooms']), plan
+    assert all(c['tool'] == 'resize_room' for c in plan['changes']), plan['changes']
+    out = await store.apply(browser)
+    assert out['status'] == 'applied', out
+    assert normalize_result(await browser('validate_layout', {}))['errors'] == 0
+    after = normalize_result(await browser('inspect_floor_space', {'floorId': floor}))
+    assert after['freeArea'] < space['freeArea']
+    print(f"PASS rooms expanded into free space: {plan['summaryVi']} (free {space['freeArea']} -> {after['freeArea']} ft²)")
 
 try:
     asyncio.run(main())

@@ -1308,7 +1308,9 @@ export function createArchMorphTools(runtime: ToolRuntime): ArchMorphTool[] {
       floorId: { type: "string", description: "The upper floor's ID from create_floor or inspect_project." },
       rooms: { type: "array", maxItems: 8, items: { type: "object", properties: { name: { type: "string" }, roomType: { type: "string", enum: ["Living Room", "Kitchen", "Bedroom", "Bathroom", "Garage", "Office", "Dining Room", "Storage", "Courtyard", "Custom"] } }, required: ["name", "roomType"], additionalProperties: false } },
       roomCount: { type: "number", minimum: 1, maximum: 8, description: "Used when rooms is omitted: default names and types are chosen." },
-      fill: { type: "boolean", description: "When rooms is omitted on a floor that already has rooms, fill every free spot." },
+      fill: { type: "boolean", description: "On a floor with rooms: fill every free spot with rooms, then grow rooms into leftovers." },
+      expandRooms: { type: "boolean", description: "On a floor with rooms: grow existing rooms into adjacent free space instead of adding rooms." },
+      expandOnly: { type: "array", maxItems: 8, items: { type: "string" }, description: "Room names or IDs allowed to grow; default all." },
     }, required: ["floorId"], additionalProperties: false },
     execute: input => {
       const project = runtime.getProject();
@@ -1317,6 +1319,8 @@ export function createArchMorphTools(runtime: ToolRuntime): ArchMorphTool[] {
         rooms: Array.isArray(input.rooms) ? input.rooms as { name: string; roomType: string }[] : undefined,
         roomCount: typeof input.roomCount === "number" ? input.roomCount : undefined,
         fill: input.fill === true,
+        expandRooms: input.expandRooms === true,
+        expandOnly: Array.isArray(input.expandOnly) ? input.expandOnly.map(String) : undefined,
       }, changes => prepareBatch({ expectedVersion: project.version, changes }));
     },
   });
